@@ -5,3 +5,4 @@ node_modules/
 dist/
 data/circle-wallets.json
 *.Zone.Identifier
+*:Zone.Identifier
