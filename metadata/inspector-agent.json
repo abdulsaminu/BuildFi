@@ -1,0 +1,11 @@
+{
+  "name": "ConstructOS Inspector Agent",
+  "role": "inspector",
+  "description": "Autonomous multi-oracle inspection agent. Detects ProofSubmitted events on ConstructionEscrow, runs vision/GPS/drone oracle verification, and emits a verified-milestone signal.",
+  "project": "BuildFi",
+  "capabilities": ["oracle-verification", "milestone-attestation"],
+  "contracts": {
+    "escrow": "0x1D4dB36a97aFf39e93071C45A1944864d6A8E70D",
+    "identityRegistry": "0x3EC9Cd867B9Eaf94380bc8a20EEcC27E02AC2812"
+  }
+}

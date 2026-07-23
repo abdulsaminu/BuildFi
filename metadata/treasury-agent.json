@@ -1,0 +1,11 @@
+{
+  "name": "BuildFi Treasury Agent",
+  "role": "treasury",
+  "description": "Autonomous treasury agent. Holds a Circle Developer-Controlled (Agent) Wallet, watches for verified-milestone signals from the Inspector Agent, runs a risk check against project budget/burn-rate, and autonomously settles USDC payment on Arc Testnet.",
+  "project": "BuildFi",
+  "capabilities": ["risk-assessment", "autonomous-usdc-settlement", "agent-wallet"],
+  "contracts": {
+    "escrow": "0x1D4dB36a97aFf39e93071C45A1944864d6A8E70D",
+    "identityRegistry": "0x3EC9Cd867B9Eaf94380bc8a20EEcC27E02AC2812"
+  }
+}
