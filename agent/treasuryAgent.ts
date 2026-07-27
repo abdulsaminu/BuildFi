@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import { runRiskCheck } from "./riskCheck";
 import { settleViaCircle } from "./circleSettle";
