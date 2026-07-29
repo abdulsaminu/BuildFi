@@ -21,6 +21,27 @@ export interface SettlementReceipt {
 const MAX_POLL_ATTEMPTS = 20;
 const POLL_INTERVAL_MS = 3000;
 
+export async function getWalletBalance(): Promise<number> {
+  const apiKey = process.env.CIRCLE_API_KEY;
+  const entitySecret = process.env.CIRCLE_ENTITY_SECRET;
+  const walletId = process.env.TREASURY_WALLET_ID;
+  const tokenId = process.env.USDC_TOKEN_ID;
+
+  if (!apiKey || !entitySecret || !walletId || !tokenId) {
+    throw new Error(
+      "Missing Circle env vars (CIRCLE_API_KEY / CIRCLE_ENTITY_SECRET / TREASURY_WALLET_ID / USDC_TOKEN_ID)",
+    );
+  }
+
+  const client = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });
+  const response = await client.getWalletTokenBalance({ id: walletId });
+  const balances = response.data?.tokenBalances ?? [];
+  const usdcEntry = balances.find((b: any) => b.token?.id === tokenId);
+
+  if (!usdcEntry) return 0;
+  return parseFloat(usdcEntry.amount);
+}
+
 export async function settleViaCircle(
   payeeAddress: string,
   amount: string, // decimal string, e.g. "5000.00"

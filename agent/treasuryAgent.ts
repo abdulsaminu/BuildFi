@@ -1,7 +1,8 @@
 import "dotenv/config";
 import express from "express";
 import { runRiskCheck } from "./riskCheck";
-import { settleViaCircle } from "./circleSettle";
+import { settleViaCircle, getWalletBalance } from "./circleSettle";
+import { loadTreasuryState, recordSettlement, computeRecentBurnRate } from "./treasuryStore";
 
 /**
  * Treasury Agent process.
@@ -13,32 +14,19 @@ import { settleViaCircle } from "./circleSettle";
  * agent-to-agent boundary: Inspector Agent approving a milestone does not
  * by itself move any money. Only Treasury Agent's own decision does.
  *
- * Inspector Agent side: after decisionEngine() returns APPROVE in
- * construct-os-v2/agent/index.ts, add a fetch call to this webhook,
- * e.g.:
+ * Treasury balance is fetched LIVE from Circle on every decision (not
+ * tracked/synced locally) so the risk check always gates against the
+ * real, current wallet balance — a genuine signal, not a value that
+ * could silently drift. Project budget/burn-rate bookkeeping (which
+ * Circle has no concept of) lives in a local JSON store — see
+ * treasuryStore.ts.
  *
- *   await fetch(`${TREASURY_AGENT_URL}/verified-milestone`, {
- *     method: "POST",
- *     headers: { "Content-Type": "application/json" },
- *     body: JSON.stringify({
- *       milestoneId: proof.milestoneId,
- *       contractorAddress: proof.contractorAgent,
- *       amount: milestoneAmount, // USDC decimal string
- *     }),
- *   });
+ * Inspector Agent side: after decisionEngine() returns APPROVE in
+ * construct-os-v2/agent/index.ts, a fetch call notifies this webhook.
  */
 
 const app = express();
 app.use(express.json());
-
-// TODO(Phase 3): replace with real treasury/project state (CFEL reducer or
-// a simple in-memory/DB store). Hardcoded for now so the decision loop is
-// demoable end-to-end before wiring full treasury state.
-const TREASURY_STATE = {
-  treasuryBalance: 245680.5,
-  projectBudgetRemaining: 90000,
-  recentBurnRate: 8230,
-};
 
 interface VerifiedMilestonePayload {
   milestoneId: string;
@@ -55,14 +43,28 @@ app.post("/verified-milestone", async (req, res) => {
 
   console.log(`[treasury-agent] Received verified milestone ${milestoneId} for ${contractorAddress}, amount ${amount}`);
 
+  let treasuryBalance: number;
+  try {
+    treasuryBalance = await getWalletBalance();
+  } catch (err) {
+    console.error(`[treasury-agent] Failed to fetch live balance:`, err instanceof Error ? err.message : err);
+    return res.status(200).json({ decision: "HOLD", reason: "Could not verify live treasury balance" });
+  }
+
+  const projectState = loadTreasuryState();
+  const recentBurnRate = computeRecentBurnRate();
+
   const risk = runRiskCheck({
     amount,
-    treasuryBalance: TREASURY_STATE.treasuryBalance,
-    projectBudgetRemaining: TREASURY_STATE.projectBudgetRemaining,
-    recentBurnRate: TREASURY_STATE.recentBurnRate,
+    treasuryBalance,
+    projectBudgetRemaining: projectState.projectBudgetRemaining,
+    recentBurnRate,
   });
 
-  console.log(`[treasury-agent] Risk check: ${risk.decision} (${risk.riskLevel}) — ${risk.reason}`);
+  console.log(
+    `[treasury-agent] Risk check: ${risk.decision} (${risk.riskLevel}) — ${risk.reason} ` +
+    `[balance: ${treasuryBalance.toFixed(2)}, budget remaining: ${projectState.projectBudgetRemaining.toFixed(2)}, burn rate: ${recentBurnRate.toFixed(2)}/day]`
+  );
 
   if (risk.decision === "HOLD") {
     return res.status(200).json({ decision: "HOLD", risk });
@@ -71,15 +73,22 @@ app.post("/verified-milestone", async (req, res) => {
   const receipt = await settleViaCircle(contractorAddress, amount.toFixed(2));
   console.log(`[treasury-agent] Settlement: ${receipt.status}`, receipt.txHash ?? receipt.reason ?? "");
 
-  if (receipt.status === "confirmed") {
-    TREASURY_STATE.treasuryBalance -= amount;
-    TREASURY_STATE.projectBudgetRemaining -= amount;
+  if (receipt.status === "confirmed" && receipt.txHash) {
+    recordSettlement(milestoneId, contractorAddress, amount, receipt.txHash);
   }
 
   return res.status(200).json({ decision: "SETTLE", risk, receipt });
 });
 
-app.get("/health", (_req, res) => res.json({ status: "ok", treasury: TREASURY_STATE }));
+app.get("/health", async (_req, res) => {
+  try {
+    const treasuryBalance = await getWalletBalance();
+    const projectState = loadTreasuryState();
+    res.json({ status: "ok", treasuryBalance, projectState });
+  } catch (err) {
+    res.status(500).json({ status: "error", reason: err instanceof Error ? err.message : String(err) });
+  }
+});
 
 const PORT = process.env.TREASURY_AGENT_PORT || 4001;
 app.listen(PORT, () => {

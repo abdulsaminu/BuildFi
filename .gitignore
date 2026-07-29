@@ -4,6 +4,8 @@ node_modules/
 *.Zone.Identifier
 dist/
 data/circle-wallets.json
-*.Zone.Identifier
-*:Zone.Identifier
-*:Zone.Identifier
+data/treasury-state.json
+AI_CHECKPOINT/
+ai-checkpoint.sh
+AI_CHECKPOINT/
+ai-checkpoint.sh
