@@ -3,13 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "start": "npx tsx agent/treasuryAgent.ts",
     "register-agents": "hardhat run scripts/registerAgents.ts --network arcTestnet",
     "treasury-agent": "tsx agent/treasuryAgent.ts"
   },
   "dependencies": {
     "@circle-fin/developer-controlled-wallets": "latest",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "tsx": "^4.16.0"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
@@ -17,7 +19,6 @@
     "@types/express": "^4.17.21",
     "dotenv": "^16.4.5",
     "hardhat": "^2.22.0",
-    "tsx": "^4.16.0",
     "typescript": "^5.5.0"
   }
 }
