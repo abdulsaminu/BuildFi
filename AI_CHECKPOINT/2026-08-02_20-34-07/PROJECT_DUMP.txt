@@ -1,3 +1,7 @@
+==================================================
+FILE: package-lock.json
+==================================================
+
 {
   "name": "buildfi",
   "version": "0.1.0",
@@ -9875,3 +9879,4270 @@
     }
   }
 }
+
+
+==================================================
+FILE: README.md
+==================================================
+
+# BuildFi
+
+**Programmable finance infrastructure for construction, powered by autonomous agents transacting on Arc.**
+
+Submission for the Programmable Money Hackathon (Build on Arc) — Autonomous Agents track.
+
+## What BuildFi does
+
+BuildFi connects two autonomous agents, each with their own on-chain identity, to remove humans from the construction payment loop:
+
+1. **Inspector Agent** verifies real-world milestone completion (vision/GPS/drone oracle data) and emits a verified signal on-chain.
+2. **Treasury Agent** holds its own USDC wallet, watches for that signal, evaluates risk (budget/burn-rate), and **autonomously decides to settle payment** — no manual approval step.
+
+This is agent-to-agent settlement: verification and payment are two independent on-chain identities transacting with each other, not a backend script moving money.
+
+## What's reused vs. what's new
+
+BuildFi is not built from zero — it unifies two existing, working systems into one autonomous flow for this track.
+
+| Component | Status | Source |
+|---|---|---|
+| Inspector Agent (oracle verification pipeline) | **Reused, already live on Arc Testnet** | [ConstructOS Inspector](#) |
+| `ConstructionEscrow` (ERC-8183) | **Reused, deployed** | ConstructOS Inspector |
+| `AgentIdentity` (ERC-8004) — Inspector Agent | **Reused, deployed** | ConstructOS Inspector |
+| CFEL treasury engine (event-sourced ledger, sub-pools) | **Reused** | [ConstructOS Finance](#) |
+| `CircleSettlementAdapter` (USDC settlement via Circle Developer-Controlled Wallets) | **Reused, verified on-chain** | ConstructOS Finance |
+| `AgentIdentity` (ERC-8004) — Treasury Agent | **New** | BuildFi |
+| Agent decision loop (Claude Agent SDK, wraps settlement call in autonomous trigger + risk check) | **New** | BuildFi, forked from [circlefin/agent-stack-starter-kits](https://github.com/circlefin/agent-stack-starter-kits) |
+| Unified dashboard | **New** | BuildFi |
+
+## Architecture
+
+```
+Inspector Agent (ERC-8004)          Treasury Agent (ERC-8004)
+   |  detects ProofSubmitted           |  holds Circle Agent Wallet
+   |  runs oracle verification         |  watches for verified signal
+   |  emits verified milestone   --->  |  runs risk check (CFEL)
+   |                                   |  autonomously calls
+   |                                   |  CircleSettlementAdapter
+   v                                   v
+ConstructionEscrow (ERC-8183)     USDC settled on Arc Testnet
+```
+
+## Status
+
+🚧 Mid-hackathon checkpoint — in progress. See [CHECKPOINT.md](./CHECKPOINT.md) for current state.
+
+## Stack
+
+Arc Testnet · USDC · Circle Developer-Controlled Wallets (Agent Wallets) · Claude Agent SDK · ERC-8004 (Agent Identity) · ERC-8183 (Construction Escrow)
+
+
+==================================================
+FILE: .gitignore
+==================================================
+
+node_modules/
+dist/
+*.Zone.Identifier
+.env
+
+
+==================================================
+FILE: docs/inspector-agent-patch.diff
+==================================================
+
+Patch for construct-os-v2/agent/index.ts
+==========================================
+
+Adds a call to the Treasury Agent's webhook right after the Inspector
+Agent approves a milestone. Reads the milestone's real amountHeld from
+ConstructionEscrow's public `milestones` mapping getter — confirmed
+against the actual Milestone struct in contracts/ConstructionEscrow.sol:
+
+    struct Milestone {
+        address contractorAgent;
+        uint256 amountHeld;
+        bytes32 proofHash;
+        uint8   status;
+        uint256 submittedAt;
+    }
+
+--- a/agent/index.ts
++++ b/agent/index.ts
+@@ -1,8 +1,10 @@
++import { ethers }             from 'ethers';
+ import { startListener }      from './listener/contractListener';
+ import { startQueue }         from './queue/jobQueue';
+ import { verificationEngine } from './verification/verificationEngine';
+ import { decisionEngine }     from './decision/decisionEngine';
+ import { arcSettler }         from './settlement/arcSettler';
+ import { reputationLedger }   from './reputation/reputationLedger';
+ import { IPFSUnreachableError } from '../shared/errors';
++import { ARC_RPC, ESCROW_ADDRESS } from '../shared/constants';
++
++const TREASURY_AGENT_URL = process.env.TREASURY_AGENT_URL || 'http://localhost:4001';
++
++const escrowReadAbi = [
++  'function milestones(bytes32) view returns (address contractorAgent, uint256 amountHeld, bytes32 proofHash, uint8 status, uint256 submittedAt)',
++];
++
++async function notifyTreasuryAgent(milestoneId: string, contractorAgent: string) {
++  try {
++    const provider = new ethers.JsonRpcProvider(ARC_RPC);
++    const escrow    = new ethers.Contract(ESCROW_ADDRESS, escrowReadAbi, provider);
++    const id        = milestoneId.startsWith('0x') ? milestoneId : `0x${milestoneId}`;
++    const milestone = await escrow.milestones(id);
++    const amountUsdc = Number(ethers.formatUnits(milestone.amountHeld, 6)); // USDC = 6 decimals
++
++    const res = await fetch(`${TREASURY_AGENT_URL}/verified-milestone`, {
++      method:  'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body:    JSON.stringify({
++        milestoneId,
++        contractorAddress: contractorAgent,
++        amount: amountUsdc,
++      }),
++    });
++
++    const body = await res.json();
++    console.log(`[treasury-notify] ${res.status}`, body);
++  } catch (err) {
++    console.warn(`[treasury-notify] failed: ${err instanceof Error ? err.message : err}`);
++  }
++}
+ 
+ async function main() {
+   const queue = startQueue();
+   console.log('Queue initialized');
+ 
+   queue.process('inspection', async (job) => {
+     const proof = job.data;
+     console.log(`Processing milestone: ${proof.milestoneId}`);
+     try {
+       const result   = await verificationEngine(proof);
+       const decision = decisionEngine(result);
+       console.log(`Decision: ${decision} (score: ${result.compositeScore.toFixed(1)})`);
+       if (decision === 'APPROVE') {
+         await arcSettler.releaseFunds(proof.milestoneId);
+         await reputationLedger.recordPass(proof.contractorAgent);
++        await notifyTreasuryAgent(proof.milestoneId, proof.contractorAgent);
+       } else {
+         await arcSettler.flagForReview(proof.milestoneId, 'Verification failed');
+         await reputationLedger.recordFail(proof.contractorAgent);
+       }
+       return result;
+     } catch (err) {
+
+Add to construct-os-v2/.env:
+  TREASURY_AGENT_URL=http://localhost:4001
+
+Note: this fires alongside the existing arcSettler.releaseFunds() call,
+which still releases funds from the escrow contract's own internal
+balance as before. The Treasury Agent's settlement (via Circle, from its
+own separate wallet) is an additional, independent USDC payment — this
+is intentional: it demonstrates a genuine second, autonomous agent
+transaction, not a replacement for the escrow's existing release.
+
+
+==================================================
+FILE: hardhat.config.ts
+==================================================
+
+import { HardhatUserConfig } from "hardhat/config";
+import "@nomicfoundation/hardhat-toolbox";
+import dotenv from "dotenv";
+dotenv.config();
+
+const config: HardhatUserConfig = {
+  solidity: "0.8.24",
+  networks: {
+    arcTestnet: {
+      url: process.env.RPC_URL || "https://rpc.testnet.arc.network",
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+      chainId: 5042002,
+      timeout: 30000,
+    },
+  },
+  etherscan: {
+    apiKey: { arcTestnet: "unused" },
+    customChains: [{
+      network: "arcTestnet",
+      chainId: 5042002,
+      urls: {
+        apiURL:     "https://testnet.arcscan.app/api",
+        browserURL: "https://testnet.arcscan.app",
+      },
+    }],
+  },
+};
+
+export default config;
+
+
+==================================================
+FILE: agent/cctp.ts
+==================================================
+
+import { initiateDeveloperControlledWalletsClient } from "@circle-fin/developer-controlled-wallets";
+
+/**
+ * Cross-chain USDC settlement via CCTP V2, using Circle's Developer-
+ * Controlled Wallets contract-execution API for BOTH legs (burn on Arc,
+ * mint on destination) — keeping one custody model consistent with the
+ * rest of Treasury Agent, rather than adopting Circle's reference repo's
+ * raw-private-key/viem pattern (see circle-cctp-fulfiller-repayment).
+ *
+ * SIMPLIFIED FLOW vs. Circle's reference app: this does a DIRECT burn ->
+ * mint straight to the destination recipient's address. It does not
+ * implement the fulfiller/repayment-escrow pattern (instant payment
+ * before attestation finality) — that solves a problem BuildFi doesn't
+ * have yet. Same underlying CCTP mechanics, less unnecessary machinery.
+ *
+ * Confirmed contract addresses/domains (Arc Testnet -> Ethereum Sepolia
+ * corridor), pulled directly from Circle's own reference implementation
+ * source (github.com/circlefin/circle-cctp-fulfiller-repayment):
+ *   tokenMessengerV2:     0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA
+ *   messageTransmitterV2: 0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275
+ *   ARC_DOMAIN: 26, SEPOLIA_DOMAIN: 0
+ *
+ * UNVERIFIED: the exact createContractExecutionTransaction parameter
+ * shape below follows Circle's documented pattern, but has NOT been
+ * test-run against the installed SDK version. Test with a tiny amount
+ * (e.g. 1 USDC) before using this for anything real — the same
+ * discipline that caught the amount/amounts quirk in circleSettle.ts.
+ */
+
+const TOKEN_MESSENGER_V2 = "0x8FE6B999Dc680CcFDD5Bf7EB0974218be2542DAA";
+const MESSAGE_TRANSMITTER_V2 = "0xE737e5cEBEEBa77EFE34D4aa090756590b1CE275";
+const ARC_DOMAIN = 26;
+const SEPOLIA_DOMAIN = 0;
+const IRIS_API_URL = "https://iris-api-sandbox.circle.com";
+const ZERO_BYTES32 = `0x${"0".repeat(64)}`;
+
+function addressToBytes32(address: string): string {
+  return `0x${"0".repeat(24)}${address.slice(2).toLowerCase()}`;
+}
+
+export interface CctpBurnResult {
+  status: "confirmed" | "failed";
+  txHash?: string;
+  reason?: string;
+}
+
+export interface CctpMintResult {
+  status: "confirmed" | "failed";
+  txHash?: string;
+  reason?: string;
+}
+
+/**
+ * Step 1: approve + depositForBurn on Arc, via Treasury Agent's existing
+ * Circle-managed wallet.
+ */
+export async function burnOnArc(
+  amountUsdc: string, // decimal string, e.g. "5.00"
+  destinationRecipientAddress: string,
+): Promise<CctpBurnResult> {
+  const apiKey = process.env.CIRCLE_API_KEY;
+  const entitySecret = process.env.CIRCLE_ENTITY_SECRET;
+  const walletId = process.env.TREASURY_WALLET_ID;
+  const usdcContractAddress = process.env.ARC_USDC_ADDRESS || "0x3600000000000000000000000000000000000000";
+
+  if (!apiKey || !entitySecret || !walletId) {
+    return { status: "failed", reason: "Missing Circle env vars for CCTP burn" };
+  }
+
+  const client = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });
+  const amountUnits = BigInt(Math.round(parseFloat(amountUsdc) * 1_000_000)); // USDC = 6 decimals
+
+  try {
+    // 1a. Approve TokenMessengerV2 to pull USDC
+    const approveTx = await client.createContractExecutionTransaction({
+      walletId,
+      contractAddress: usdcContractAddress,
+      abiFunctionSignature: "approve(address,uint256)",
+      abiParameters: [TOKEN_MESSENGER_V2, amountUnits.toString()],
+      fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+    });
+    await pollTransaction(client, approveTx.data?.id);
+
+    // 1b. depositForBurn — mint recipient is the supplier's address on Sepolia directly
+    const burnTx = await client.createContractExecutionTransaction({
+      walletId,
+      contractAddress: TOKEN_MESSENGER_V2,
+      abiFunctionSignature:
+        "depositForBurn(uint256,uint32,bytes32,address,bytes32,uint256,uint32)",
+      abiParameters: [
+        amountUnits.toString(),
+        SEPOLIA_DOMAIN,
+        addressToBytes32(destinationRecipientAddress),
+        usdcContractAddress,
+        ZERO_BYTES32,
+        "0", // maxFee — 0 for standard (slower, cheaper) transfer; see quoteBurn pattern in Circle's reference for fee-market pricing
+        "2000", // minFinalityThreshold — FINALIZED (2000) for standard transfer, safer than CONFIRMED (1000) for a first test
+      ],
+      fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+    });
+    const receipt = await pollTransaction(client, burnTx.data?.id);
+    return { status: "confirmed", txHash: receipt.txHash };
+  } catch (err) {
+    return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Step 2: poll Iris for the attested burn message.
+ */
+export async function fetchAttestation(
+  sourceTxHash: string,
+  maxAttempts = 20,
+  intervalMs = 5000,
+): Promise<{ message: string; attestation: string } | null> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(`${IRIS_API_URL}/v2/messages/${ARC_DOMAIN}?transactionHash=${sourceTxHash}`);
+    if (res.ok) {
+      const json = await res.json();
+      const first = json.messages?.[0];
+      if (first?.message && first?.attestation && first.attestation !== "PENDING") {
+        return { message: first.message, attestation: first.attestation };
+      }
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return null;
+}
+
+/**
+ * Step 3: receiveMessage on Sepolia, via a SEPARATE Circle-managed
+ * wallet on the destination chain (Circle wallets are chain-specific —
+ * Treasury Agent's existing Arc wallet cannot also sign on Sepolia).
+ * Requires SEPOLIA_WALLET_ID to be set once that wallet is created.
+ */
+export async function mintOnDestination(
+  message: string,
+  attestation: string,
+): Promise<CctpMintResult> {
+  const apiKey = process.env.CIRCLE_API_KEY;
+  const entitySecret = process.env.CIRCLE_ENTITY_SECRET;
+  const sepoliaWalletId = process.env.SEPOLIA_WALLET_ID;
+
+  if (!apiKey || !entitySecret || !sepoliaWalletId) {
+    return { status: "failed", reason: "Missing Circle env vars for CCTP mint (need SEPOLIA_WALLET_ID)" };
+  }
+
+  const client = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });
+
+  try {
+    const mintTx = await client.createContractExecutionTransaction({
+      walletId: sepoliaWalletId,
+      contractAddress: MESSAGE_TRANSMITTER_V2,
+      abiFunctionSignature: "receiveMessage(bytes,bytes)",
+      abiParameters: [message, attestation],
+      fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+    });
+    const receipt = await pollTransaction(client, mintTx.data?.id);
+    return { status: "confirmed", txHash: receipt.txHash };
+  } catch (err) {
+    return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function pollTransaction(
+  client: ReturnType<typeof initiateDeveloperControlledWalletsClient>,
+  txId: string | undefined,
+  maxAttempts = 20,
+  intervalMs = 3000,
+): Promise<{ txHash?: string }> {
+  if (!txId) throw new Error("No transaction id returned from Circle");
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const status = await client.getTransaction({ id: txId });
+    const state = status.data?.transaction?.state;
+    if (state === "CONFIRMED" || state === "COMPLETE") {
+      return { txHash: status.data?.transaction?.txHash };
+    }
+    if (state === "FAILED" || state === "CANCELLED") {
+      throw new Error(`Circle transaction ${state}`);
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error("Transaction still pending after poll window");
+}
+
+/**
+ * Full orchestration: burn on Arc -> wait for attestation -> mint on Sepolia.
+ */
+export async function settleCrossChain(
+  amountUsdc: string,
+  destinationRecipientAddress: string,
+): Promise<{ burn: CctpBurnResult; mint?: CctpMintResult }> {
+  const burn = await burnOnArc(amountUsdc, destinationRecipientAddress);
+  if (burn.status !== "confirmed" || !burn.txHash) {
+    return { burn };
+  }
+
+  const attestation = await fetchAttestation(burn.txHash);
+  if (!attestation) {
+    return { burn, mint: { status: "failed", reason: "Attestation not available after poll window" } };
+  }
+
+  const mint = await mintOnDestination(attestation.message, attestation.attestation);
+  return { burn, mint };
+}
+
+
+==================================================
+FILE: agent/treasuryStore.ts
+==================================================
+
+import fs from "fs";
+import path from "path";
+
+/**
+ * Simple JSON-file-backed store for project-level treasury bookkeeping
+ * (budget remaining, burn rate, settlement history). This is the part
+ * Circle has no concept of — it's ours to track. Real wallet BALANCE is
+ * NOT stored here; that's fetched live from Circle each time a decision
+ * is made (see circleSettle.ts's getWalletBalance), so the risk check
+ * always gates against the actual on-chain-backed number, not a value
+ * that could silently drift out of sync.
+ */
+
+const STORE_PATH = path.join(__dirname, "..", "data", "treasury-state.json");
+
+export interface TreasuryProjectState {
+  projectBudgetTotal: number;
+  projectBudgetRemaining: number;
+  settlements: Array<{
+    milestoneId: string;
+    contractorAddress: string;
+    amount: number;
+    txHash: string;
+    settledAt: string;
+  }>;
+}
+
+const DEFAULT_STATE: TreasuryProjectState = {
+  projectBudgetTotal: 90000,
+  projectBudgetRemaining: 90000,
+  settlements: [],
+};
+
+function ensureStoreDir() {
+  const dir = path.dirname(STORE_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+export function loadTreasuryState(): TreasuryProjectState {
+  ensureStoreDir();
+  if (!fs.existsSync(STORE_PATH)) {
+    fs.writeFileSync(STORE_PATH, JSON.stringify(DEFAULT_STATE, null, 2));
+    return { ...DEFAULT_STATE };
+  }
+  const raw = fs.readFileSync(STORE_PATH, "utf8");
+  return JSON.parse(raw) as TreasuryProjectState;
+}
+
+export function recordSettlement(
+  milestoneId: string,
+  contractorAddress: string,
+  amount: number,
+  txHash: string,
+): TreasuryProjectState {
+  const state = loadTreasuryState();
+  state.projectBudgetRemaining = Math.max(0, state.projectBudgetRemaining - amount);
+  state.settlements.push({
+    milestoneId,
+    contractorAddress,
+    amount,
+    txHash,
+    settledAt: new Date().toISOString(),
+  });
+  ensureStoreDir();
+  fs.writeFileSync(STORE_PATH, JSON.stringify(state, null, 2));
+  return state;
+}
+
+/**
+ * Recent burn rate: total settled amount over the last N days / N.
+ * Falls back to 0 if there's no settlement history yet (a fresh project
+ * shouldn't be penalized by an arbitrary placeholder burn rate).
+ */
+export function computeRecentBurnRate(days = 7): number {
+  const state = loadTreasuryState();
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const recentTotal = state.settlements
+    .filter((s) => new Date(s.settledAt).getTime() >= cutoff)
+    .reduce((sum, s) => sum + s.amount, 0);
+  return recentTotal / days;
+}
+
+
+==================================================
+FILE: agent/circleSettle.ts
+==================================================
+
+import { initiateDeveloperControlledWalletsClient } from "@circle-fin/developer-controlled-wallets";
+
+/**
+ * Treasury Agent's own settlement execution, using the same Circle
+ * Developer-Controlled Wallet primitive already proven out in
+ * ConstructOS Finance's CircleSettlementAdapter (see that repo for the
+ * original standalone adapter + bounded-poll pattern this borrows from).
+ *
+ * Known SDK quirk (confirmed against installed SDK v10.8.0): createTransaction
+ * wants `amount` as a singular key with an array value, not `amounts`, despite
+ * some doc examples showing the plural form. Using the wrong key returns a
+ * generic "API parameter invalid" (code 2) with no field-level detail.
+ */
+
+export interface SettlementReceipt {
+  status: "confirmed" | "pending" | "failed";
+  txHash?: string;
+  reason?: string;
+}
+
+const MAX_POLL_ATTEMPTS = 20;
+const POLL_INTERVAL_MS = 3000;
+
+export async function getWalletBalance(): Promise<number> {
+  const apiKey = process.env.CIRCLE_API_KEY;
+  const entitySecret = process.env.CIRCLE_ENTITY_SECRET;
+  const walletId = process.env.TREASURY_WALLET_ID;
+  const tokenId = process.env.USDC_TOKEN_ID;
+
+  if (!apiKey || !entitySecret || !walletId || !tokenId) {
+    throw new Error(
+      "Missing Circle env vars (CIRCLE_API_KEY / CIRCLE_ENTITY_SECRET / TREASURY_WALLET_ID / USDC_TOKEN_ID)",
+    );
+  }
+
+  const client = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });
+  const response = await client.getWalletTokenBalance({ id: walletId });
+  const balances = response.data?.tokenBalances ?? [];
+  const usdcEntry = balances.find((b: any) => b.token?.id === tokenId);
+
+  if (!usdcEntry) return 0;
+  return parseFloat(usdcEntry.amount);
+}
+
+export async function settleViaCircle(
+  payeeAddress: string,
+  amount: string, // decimal string, e.g. "5000.00"
+): Promise<SettlementReceipt> {
+  const apiKey = process.env.CIRCLE_API_KEY;
+  const entitySecret = process.env.CIRCLE_ENTITY_SECRET;
+  const walletId = process.env.TREASURY_WALLET_ID; // Circle wallet id, distinct from its on-chain address
+  const tokenId = process.env.USDC_TOKEN_ID; // Circle's tokenId for USDC on Arc Testnet
+
+  if (!apiKey || !entitySecret || !walletId || !tokenId) {
+    return {
+      status: "failed",
+      reason: "Missing Circle env vars (CIRCLE_API_KEY / CIRCLE_ENTITY_SECRET / TREASURY_WALLET_ID / USDC_TOKEN_ID)",
+    };
+  }
+
+  if (!/^0x[a-fA-F0-9]{40}$/.test(payeeAddress)) {
+    return { status: "failed", reason: `Invalid payee address: ${payeeAddress}` };
+  }
+
+  try {
+    const client = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });
+
+    const response = await client.createTransaction({
+      walletId,
+      tokenId,
+      destinationAddress: payeeAddress,
+      amounts: [amount], // NOTE: Circle's current published docs use `amounts` (plural).
+      // Earlier CFEL work found the installed SDK v10.8.0 actually wanted `amount`
+      // (singular) instead — docs and installed package have disagreed before.
+      // If this throws a generic "API parameter invalid" (code 2), try switching
+      // this key to `amount` and re-run.
+      fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+    });
+
+    const txId = response.data?.id;
+    if (!txId) return { status: "failed", reason: "No transaction id returned from Circle" };
+
+    for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
+      const status = await client.getTransaction({ id: txId });
+      const state = status.data?.transaction?.state;
+
+      if (state === "CONFIRMED" || state === "COMPLETE") {
+        return { status: "confirmed", txHash: status.data?.transaction?.txHash };
+      }
+      if (state === "FAILED" || state === "CANCELLED") {
+        return { status: "failed", reason: `Circle transaction ${state}` };
+      }
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    }
+
+    return { status: "pending", reason: "Still processing after poll window", txHash: undefined };
+  } catch (err) {
+    return { status: "failed", reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+
+==================================================
+FILE: agent/treasuryAgent.ts
+==================================================
+
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import { runRiskCheck } from "./riskCheck";
+import { settleViaCircle, getWalletBalance } from "./circleSettle";
+import { settleCrossChain } from "./cctp";
+import { loadTreasuryState, recordSettlement, computeRecentBurnRate } from "./treasuryStore";
+
+/**
+ * Treasury Agent process.
+ *
+ * Listens for verified-milestone signals from the Inspector Agent
+ * (construct-os-v2), running as a separate process/repo. On each signal,
+ * the Treasury Agent independently runs a risk check against its own
+ * state and DECIDES whether to autonomously settle USDC — this is the
+ * agent-to-agent boundary: Inspector Agent approving a milestone does not
+ * by itself move any money. Only Treasury Agent's own decision does.
+ *
+ * Treasury balance is fetched LIVE from Circle on every decision (not
+ * tracked/synced locally) so the risk check always gates against the
+ * real, current wallet balance — a genuine signal, not a value that
+ * could silently drift. Project budget/burn-rate bookkeeping (which
+ * Circle has no concept of) lives in a local JSON store — see
+ * treasuryStore.ts.
+ *
+ * Inspector Agent side: after decisionEngine() returns APPROVE in
+ * construct-os-v2/agent/index.ts, a fetch call notifies this webhook.
+ */
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Track a small in-memory event log for the frontend's live-flow view.
+// This is presentation-layer only — treasuryStore.ts remains the source
+// of truth for actual settlement records.
+interface FlowEvent {
+  id: string;
+  milestoneId: string;
+  contractorAddress: string;
+  amount: number;
+  stage: "received" | "risk_checked" | "settled" | "held" | "failed";
+  detail: string;
+  timestamp: string;
+}
+const recentEvents: FlowEvent[] = [];
+function logEvent(e: Omit<FlowEvent, "id" | "timestamp">) {
+  recentEvents.unshift({ ...e, id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, timestamp: new Date().toISOString() });
+  if (recentEvents.length > 50) recentEvents.length = 50;
+}
+
+interface VerifiedMilestonePayload {
+  milestoneId: string;
+  contractorAddress: string;
+  amount: number;
+  destinationChain?: "sepolia"; // if set, settle via CCTP instead of a same-chain Circle transfer
+}
+
+app.post("/verified-milestone", async (req, res) => {
+  const { milestoneId, contractorAddress, amount, destinationChain } = req.body as VerifiedMilestonePayload;
+
+  if (!milestoneId || !contractorAddress || !amount) {
+    return res.status(400).json({ error: "milestoneId, contractorAddress, and amount are required" });
+  }
+
+  console.log(`[treasury-agent] Received verified milestone ${milestoneId} for ${contractorAddress}, amount ${amount}`);
+  logEvent({ milestoneId, contractorAddress, amount, stage: "received", detail: "Inspector Agent verified milestone" });
+
+  let treasuryBalance: number;
+  try {
+    treasuryBalance = await getWalletBalance();
+  } catch (err) {
+    console.error(`[treasury-agent] Failed to fetch live balance:`, err instanceof Error ? err.message : err);
+    logEvent({ milestoneId, contractorAddress, amount, stage: "failed", detail: "Could not verify live treasury balance" });
+    return res.status(200).json({ decision: "HOLD", reason: "Could not verify live treasury balance" });
+  }
+
+  const projectState = loadTreasuryState();
+  const recentBurnRate = computeRecentBurnRate();
+
+  const risk = runRiskCheck({
+    amount,
+    treasuryBalance,
+    projectBudgetRemaining: projectState.projectBudgetRemaining,
+    recentBurnRate,
+  });
+
+  console.log(
+    `[treasury-agent] Risk check: ${risk.decision} (${risk.riskLevel}) — ${risk.reason} ` +
+    `[balance: ${treasuryBalance.toFixed(2)}, budget remaining: ${projectState.projectBudgetRemaining.toFixed(2)}, burn rate: ${recentBurnRate.toFixed(2)}/day]`
+  );
+  logEvent({ milestoneId, contractorAddress, amount, stage: "risk_checked", detail: `${risk.decision}: ${risk.reason}` });
+
+  if (risk.decision === "HOLD") {
+    logEvent({ milestoneId, contractorAddress, amount, stage: "held", detail: risk.reason });
+    return res.status(200).json({ decision: "HOLD", risk });
+  }
+
+  if (destinationChain === "sepolia") {
+    logEvent({ milestoneId, contractorAddress, amount, stage: "risk_checked", detail: `${risk.decision}: settling cross-chain via CCTP to Sepolia` });
+    const { burn, mint } = await settleCrossChain(amount.toFixed(2), contractorAddress);
+    console.log(`[treasury-agent] CCTP burn:`, burn.status, burn.txHash ?? burn.reason ?? "");
+    if (mint) console.log(`[treasury-agent] CCTP mint:`, mint.status, mint.txHash ?? mint.reason ?? "");
+
+    if (burn.status === "confirmed" && mint?.status === "confirmed" && mint.txHash) {
+      recordSettlement(milestoneId, contractorAddress, amount, mint.txHash);
+      logEvent({ milestoneId, contractorAddress, amount, stage: "settled", detail: mint.txHash });
+    } else {
+      logEvent({ milestoneId, contractorAddress, amount, stage: "failed", detail: mint?.reason || burn.reason || "CCTP settlement failed" });
+    }
+    return res.status(200).json({ decision: "SETTLE", risk, cctp: { burn, mint } });
+  }
+
+  const receipt = await settleViaCircle(contractorAddress, amount.toFixed(2));
+  console.log(`[treasury-agent] Settlement: ${receipt.status}`, receipt.txHash ?? receipt.reason ?? "");
+
+  if (receipt.status === "confirmed" && receipt.txHash) {
+    recordSettlement(milestoneId, contractorAddress, amount, receipt.txHash);
+    logEvent({ milestoneId, contractorAddress, amount, stage: "settled", detail: receipt.txHash });
+  } else {
+    logEvent({ milestoneId, contractorAddress, amount, stage: "failed", detail: receipt.reason || "Settlement failed" });
+  }
+
+  return res.status(200).json({ decision: "SETTLE", risk, receipt });
+});
+
+app.get("/activity", (_req, res) => {
+  res.json({ events: recentEvents });
+});
+
+app.get("/agents", (_req, res) => {
+  res.json({
+    agents: [
+      {
+        name: "Inspector Agent",
+        role: "inspector",
+        address: process.env.INSPECTOR_AGENT_ADDRESS || null,
+        registrationTx: "0x6aa9222e28e66307fb5a99154e0738587c69b2c679f0a6bfa3cc85b7257bc2c7",
+      },
+      {
+        name: "Treasury Agent",
+        role: "treasury",
+        address: process.env.TREASURY_AGENT_ADDRESS || null,
+        registrationTx: "0x6fd008c97c2699044e10a42f8d9091ebc46a825c33cdc5fc75e252e1323e4d30",
+      },
+    ],
+  });
+});
+
+app.get("/health", async (_req, res) => {
+  try {
+    const treasuryBalance = await getWalletBalance();
+    const projectState = loadTreasuryState();
+    res.json({ status: "ok", treasuryBalance, projectState });
+  } catch (err) {
+    res.status(500).json({ status: "error", reason: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+const PORT = process.env.TREASURY_AGENT_PORT || 4001;
+app.listen(PORT, () => {
+  console.log(`Treasury Agent listening on port ${PORT}`);
+});
+
+
+==================================================
+FILE: agent/riskCheck.ts
+==================================================
+
+/**
+ * Minimal risk check the Treasury Agent runs before autonomously settling.
+ * This is what makes settlement a genuine agent decision rather than a
+ * pass-through: the agent can refuse or flag a payment even after the
+ * Inspector Agent approved the milestone, if treasury risk signals say no.
+ *
+ * Deliberately simple for the hackathon window — real signals (treasury
+ * balance, project budget, burn rate), not a placeholder that always
+ * returns true. Extend with CFEL's fuller reducer state once wired in.
+ */
+
+export interface RiskCheckInput {
+  amount: number;          // USDC amount requested for this milestone
+  treasuryBalance: number;  // current USDC balance available to Treasury Agent
+  projectBudgetRemaining: number; // remaining budget for the project this milestone belongs to
+  recentBurnRate: number;   // USDC/day spent recently, for overrun forecasting
+}
+
+export interface RiskCheckResult {
+  decision: "SETTLE" | "HOLD";
+  reason: string;
+  riskLevel: "low" | "medium" | "high";
+}
+
+const MAX_SINGLE_PAYMENT_RATIO = 0.5; // refuse if one payment would drain >50% of treasury
+const BUDGET_OVERRUN_BUFFER = 1.0;    // refuse if payment would exceed remaining project budget
+
+export function runRiskCheck(input: RiskCheckInput): RiskCheckResult {
+  const { amount, treasuryBalance, projectBudgetRemaining } = input;
+
+  if (amount > treasuryBalance) {
+    return { decision: "HOLD", reason: "Insufficient treasury balance", riskLevel: "high" };
+  }
+
+  if (amount > projectBudgetRemaining * BUDGET_OVERRUN_BUFFER) {
+    return { decision: "HOLD", reason: "Payment would exceed remaining project budget", riskLevel: "high" };
+  }
+
+  const drainRatio = amount / treasuryBalance;
+  if (drainRatio > MAX_SINGLE_PAYMENT_RATIO) {
+    return {
+      decision: "HOLD",
+      reason: `Single payment would drain ${(drainRatio * 100).toFixed(0)}% of treasury`,
+      riskLevel: "medium",
+    };
+  }
+
+  const riskLevel = drainRatio > 0.25 ? "medium" : "low";
+  return { decision: "SETTLE", reason: "Within budget and treasury limits", riskLevel };
+}
+
+
+==================================================
+FILE: ai-checkpoint.sh
+==================================================
+
+#!/usr/bin/env bash
+# =============================================================================
+# Universal AI Handoff System (UAHS)
+# Version: 1.0.1
+# Compatible: Ubuntu, macOS, Linux, WSL
+# =============================================================================
+
+set -euo pipefail
+
+# =============================================================================
+# COLOR DEFINITIONS
+# =============================================================================
+if [[ -t 1 ]] && command -v tput &>/dev/null && [[ $(tput colors 2>/dev/null || echo 0) -gt 0 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'
+    CYAN='\033[0;36m'
+    WHITE='\033[1;37m'
+    GRAY='\033[0;90m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    MAGENTA=''
+    CYAN=''
+    WHITE=''
+    GRAY=''
+    BOLD=''
+    DIM=''
+    NC=''
+fi
+
+# =============================================================================
+# GLOBAL VARIABLES
+# =============================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${SCRIPT_DIR}"
+CHECKPOINT_DIR=""
+TIMESTAMP=""
+LOG_FILE=""
+EXCLUDED_DIRS=()
+EXCLUDED_FILES=()
+DETECTED_STACK=()
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+log_info() {
+    echo -e "${BLUE}[*]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[✓]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[!]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[✗]${NC} $1"
+}
+
+log_progress() {
+    echo -ne "${CYAN}[→]${NC} $1\r"
+}
+
+log_complete() {
+    echo -e "${GREEN}[✓]${NC} $1"
+}
+
+print_header() {
+    echo ""
+    echo -e "${BOLD}${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${MAGENTA}║${NC}          ${WHITE}Universal AI Handoff System (UAHS)${NC}              ${BOLD}${MAGENTA}║${NC}"
+    echo -e "${BOLD}${MAGENTA}║${NC}                    ${GRAY}Version 1.0.1${NC}                            ${BOLD}${MAGENTA}║${NC}"
+    echo -e "${BOLD}${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+safe_mkdir() {
+    mkdir -p "$1" 2>/dev/null || true
+}
+
+safe_write() {
+    local file="$1"
+    local content="$2"
+    safe_mkdir "$(dirname "$file")"
+    echo "$content" > "$file"
+}
+
+get_timestamp() {
+    date +"%Y-%m-%d_%H-%M-%S"
+}
+
+# Helper: does at least one file matching a glob pattern exist in cwd?
+# Usage: glob_exists "*.js"
+glob_exists() {
+    compgen -G "$1" > /dev/null 2>&1
+}
+
+# =============================================================================
+# DETECTION FUNCTIONS
+# =============================================================================
+
+detect_language() {
+    local lang=""
+
+    [[ -f "package.json" ]] && lang+="TypeScript "
+    [[ -f "tsconfig.json" ]] && lang+="TypeScript "
+    { glob_exists "*.js" || [[ -f "index.js" ]] || [[ -f "app.js" ]]; } && lang+="JavaScript "
+    [[ -f "requirements.txt" || -f "pyproject.toml" || -f "setup.py" ]] && lang+="Python "
+    [[ -f "Cargo.toml" ]] && lang+="Rust "
+    [[ -f "go.mod" ]] && lang+="Go "
+    [[ -f "pom.xml" || -f "build.gradle" ]] && lang+="Java "
+    [[ -f "composer.json" ]] && lang+="PHP "
+    glob_exists "*.csproj" && lang+="C# "
+    glob_exists "*.sln" && lang+="C# "
+    glob_exists "*.rs" && lang+="Rust "
+    glob_exists "*.py" && lang+="Python "
+    glob_exists "*.go" && lang+="Go "
+    glob_exists "*.java" && lang+="Java "
+    glob_exists "*.php" && lang+="PHP "
+
+    echo "${lang}" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+detect_framework() {
+    local fw=""
+
+    # Frontend
+    [[ -f "package.json" ]] && grep -q '"react"' package.json 2>/dev/null && fw+="React "
+    [[ -f "package.json" ]] && grep -q '"vue"' package.json 2>/dev/null && fw+="Vue "
+    [[ -f "package.json" ]] && grep -q '"@angular/core"' package.json 2>/dev/null && fw+="Angular "
+    [[ -f "next.config.js" || -f "next.config.mjs" || -f "next.config.ts" ]] && fw+="Next.js "
+    [[ -f "nuxt.config.ts" || -f "nuxt.config.js" ]] && fw+="Nuxt "
+    [[ -f "svelte.config.js" ]] && fw+="Svelte "
+    [[ -f "vite.config.ts" || -f "vite.config.js" ]] && fw+="Vite "
+    [[ -f "tailwind.config.js" || -f "tailwind.config.ts" ]] && fw+="TailwindCSS "
+    [[ -f "webpack.config.js" || -f "webpack.config.ts" ]] && fw+="Webpack "
+
+    # Backend
+    [[ -f "package.json" ]] && grep -q '"express"' package.json 2>/dev/null && fw+="Express "
+    [[ -f "package.json" ]] && grep -q '"@nestjs/core"' package.json 2>/dev/null && fw+="NestJS "
+    [[ -f "package.json" ]] && grep -q '"fastify"' package.json 2>/dev/null && fw+="Fastify "
+    [[ -f "package.json" ]] && grep -q '"koa"' package.json 2>/dev/null && fw+="Koa "
+    [[ -f "manage.py" || -f "wsgi.py" ]] && fw+="Django "
+    [[ -f "app.py" ]] && grep -q "flask" app.py 2>/dev/null && fw+="Flask "
+    [[ -f "main.py" ]] && grep -q "fastapi" main.py 2>/dev/null && fw+="FastAPI "
+    [[ -f "application.properties" || -f "application.yml" ]] && fw+="Spring "
+    [[ -f "artisan" ]] && fw+="Laravel "
+
+    echo "${fw}" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+detect_database() {
+    local db=""
+
+    [[ -f "prisma/schema.prisma" ]] && db+="Prisma/PostgreSQL "
+    [[ -f "knexfile.js" || -f "knexfile.ts" ]] && db+="Knex "
+    [[ -d "migrations" ]] && db+="Migrations "
+    glob_exists "*.sql" && db+="SQL "
+    [[ -f "drizzle.config.ts" ]] && db+="Drizzle "
+    [[ -f "package.json" ]] && grep -q "mongoose" package.json 2>/dev/null && db+="MongoDB/Mongoose "
+    [[ -f "package.json" ]] && grep -q "typeorm" package.json 2>/dev/null && db+="TypeORM "
+    [[ -f "package.json" ]] && grep -q "pg" package.json 2>/dev/null && db+="PostgreSQL/pg "
+    [[ -f "package.json" ]] && grep -q "mysql" package.json 2>/dev/null && db+="MySQL "
+    [[ -f "package.json" ]] && grep -q "better-sqlite3" package.json 2>/dev/null && db+="SQLite "
+    [[ -f "requirements.txt" ]] && grep -q "psycopg2" requirements.txt 2>/dev/null && db+="PostgreSQL/Python "
+    [[ -f "requirements.txt" ]] && grep -q "sqlalchemy" requirements.txt 2>/dev/null && db+="SQLAlchemy "
+    [[ -f "requirements.txt" ]] && grep -q "pymongo" requirements.txt 2>/dev/null && db+="MongoDB/PyMongo "
+    [[ -f "requirements.txt" ]] && grep -q "redis" requirements.txt 2>/dev/null && db+="Redis "
+
+    echo "${db}" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+detect_blockchain() {
+    local bc=""
+
+    [[ -f "hardhat.config.js" || -f "hardhat.config.ts" ]] && bc+="Hardhat "
+    [[ -f "foundry.toml" ]] && bc+="Foundry "
+    [[ -d "contracts" ]] && bc+="Smart Contracts "
+    [[ -f "package.json" ]] && grep -q "ethers" package.json 2>/dev/null && bc+="Ethers.js "
+    [[ -f "package.json" ]] && grep -q "viem" package.json 2>/dev/null && bc+="Viem "
+    [[ -f "package.json" ]] && grep -q "web3" package.json 2>/dev/null && bc+="Web3.js "
+    [[ -f "package.json" ]] && grep -q "@openzeppelin" package.json 2>/dev/null && bc+="OpenZeppelin "
+    [[ -f "package.json" ]] && grep -q "wagmi" package.json 2>/dev/null && bc+="Wagmi "
+
+    echo "${bc}" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+detect_testing() {
+    local test=""
+
+    [[ -f "jest.config.js" || -f "jest.config.ts" ]] && test+="Jest "
+    [[ -f "vitest.config.ts" || -f "vitest.config.js" ]] && test+="Vitest "
+    [[ -f "package.json" ]] && grep -q '"cypress"' package.json 2>/dev/null && test+="Cypress "
+    [[ -f "package.json" ]] && grep -q '"@playwright/test"' package.json 2>/dev/null && test+="Playwright "
+    [[ -f "pytest.ini" || -f "conftest.py" ]] && test+="Pytest "
+    [[ -f "Cargo.toml" ]] && grep -q "dev-dependencies" Cargo.toml 2>/dev/null && test+="Rust Tests "
+    [[ -f "go.mod" ]] && test+="Go Tests "
+
+    echo "${test}" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+detect_ai() {
+    local ai=""
+
+    [[ -f "package.json" ]] && grep -q "openai" package.json 2>/dev/null && ai+="OpenAI "
+    [[ -f "package.json" ]] && grep -q "@anthropic-ai" package.json 2>/dev/null && ai+="Anthropic "
+    [[ -f "package.json" ]] && grep -q "langchain" package.json 2>/dev/null && ai+="LangChain "
+    [[ -f "package.json" ]] && grep -q "llamaindex" package.json 2>/dev/null && ai+="LlamaIndex "
+    [[ -f "requirements.txt" ]] && grep -q "openai" requirements.txt 2>/dev/null && ai+="OpenAI "
+    [[ -f "requirements.txt" ]] && grep -q "anthropic" requirements.txt 2>/dev/null && ai+="Anthropic "
+    [[ -f "requirements.txt" ]] && grep -q "langchain" requirements.txt 2>/dev/null && ai+="LangChain "
+    [[ -f "requirements.txt" ]] && grep -q "llamaindex" requirements.txt 2>/dev/null && ai+="LlamaIndex "
+
+    echo "${ai}" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+detect_cloud() {
+    local cloud=""
+
+    [[ -f "serverless.yml" ]] && cloud+="AWS Lambda "
+    { [[ -d "terraform" ]] || glob_exists "*.tf"; } && cloud+="Terraform "
+    [[ -f "docker-compose.yml" || -f "Dockerfile" ]] && cloud+="Docker "
+    [[ -f "vercel.json" ]] && cloud+="Vercel "
+    [[ -f "netlify.toml" ]] && cloud+="Netlify "
+    [[ -f "firebase.json" ]] && cloud+="Firebase "
+    [[ -e "supabase" ]] && cloud+="Supabase "
+    [[ -f "railway.json" ]] && cloud+="Railway "
+    [[ -f "fly.toml" ]] && cloud+="Fly.io "
+
+    echo "${cloud}" | tr ' ' '\n' | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+get_project_name() {
+    local name=""
+
+    [[ -f "package.json" ]] && name=$(grep -o '"name": *"[^"]*"' package.json 2>/dev/null | head -1 | cut -d'"' -f4)
+    [[ -z "$name" && -f "Cargo.toml" ]] && name=$(grep -o '^name = *"[^"]*"' Cargo.toml 2>/dev/null | head -1 | cut -d'"' -f2)
+    [[ -z "$name" && -f "go.mod" ]] && name=$(head -1 go.mod 2>/dev/null | awk '{print $2}')
+    [[ -z "$name" && -f "pyproject.toml" ]] && name=$(grep -o '^name = *"[^"]*"' pyproject.toml 2>/dev/null | head -1 | cut -d'"' -f2)
+    [[ -z "$name" && -f "composer.json" ]] && name=$(grep -o '"name": *"[^"]*"' composer.json 2>/dev/null | head -1 | cut -d'"' -f4)
+    [[ -z "$name" && -f "pom.xml" ]] && name=$(grep -o '<artifactId>[^<]*</artifactId>' pom.xml 2>/dev/null | head -1 | sed 's/<[^>]*>//g')
+
+    [[ -z "$name" ]] && name="$(basename "$PROJECT_DIR")"
+
+    echo "$name"
+}
+
+get_project_purpose() {
+    if [[ -f "README.md" ]]; then
+        head -30 README.md 2>/dev/null | grep -v '^#' | grep -v '^\[' | grep -v '^!' | grep -v '^$' | head -5 | tr '\n' ' ' || true
+    elif [[ -f "README.rst" ]]; then
+        head -30 README.rst 2>/dev/null | grep -v '^=' | grep -v '^\.\.' | grep -v '^$' | head -5 | tr '\n' ' ' || true
+    else
+        echo "No README found"
+    fi
+}
+
+# =============================================================================
+# FILE COLLECTION
+# =============================================================================
+
+should_exclude_dir() {
+    local dir="$1"
+    local basename="$(basename "$dir")"
+
+    case "$basename" in
+        node_modules|.git|dist|build|coverage|.cache|.next|.nuxt|.output|\
+        target|vendor|.venv|__pycache__|.mypy_cache|.pytest_cache|.tox|\
+        .eggs|*.egg-info|.hg|.svn|.turbo|.parcel-cache|\
+        .dart_tool|.gradle|.idea|.vscode|*.xcodeproj|*.xcworkspace|\
+        Pods|.pub-cache|.terraform|.tfstate)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+should_exclude_file() {
+    local file="$1"
+    local basename="$(basename "$file")"
+    local ext="${file##*.}"
+
+    # Binary files
+    case "$ext" in
+        png|jpg|jpeg|gif|bmp|ico|svg|webp|mp4|mp3|wav|avi|mov|\
+        zip|tar|gz|bz2|rar|7z|exe|dll|so|dylib|bin|obj|\
+        o|a|lib|wasm|lock|log)
+            return 0
+            ;;
+    esac
+
+    # Large generated files
+    case "$basename" in
+        *.min.js|*.min.css|*.map|*.bundle|*.chunk|package-lock.json|\
+        yarn.lock|pnpm-lock.yaml|composer.lock|Gemfile.lock|Cargo.lock|\
+        go.sum|poetry.lock|Pipfile.lock|.DS_Store|Thumbs.db)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+collect_source_files() {
+    local output_file="$1"
+    > "$output_file"
+
+    log_info "Collecting source files..."
+
+    find "$PROJECT_DIR" -type f \
+        ! -path "*/node_modules/*" \
+        ! -path "*/.git/*" \
+        ! -path "*/dist/*" \
+        ! -path "*/build/*" \
+        ! -path "*/coverage/*" \
+        ! -path "*/.cache/*" \
+        ! -path "*/.next/*" \
+        ! -path "*/target/*" \
+        ! -path "*/vendor/*" \
+        ! -path "*/__pycache__/*" \
+        ! -path "*/.venv/*" \
+        ! -path "*/node_modules/.cache/*" \
+        ! -path "*/AI_CHECKPOINT/*" \
+        ! -name ".env" \
+        ! -name ".env.local" \
+        ! -name ".env.*.local" \
+        ! -name ".env.development" \
+        ! -name ".env.production" \
+        ! -name ".env.staging" \
+        ! -name ".env.test" \
+        ! -name "*.pem" \
+        ! -name "*.key" \
+        ! -name "id_rsa" \
+        ! -name "id_ed25519" \
+        ! -name "*.p12" \
+        ! -name "*.pfx" \
+        ! -name "*.lock" \
+        ! -name "*.map" \
+        ! -name "*.min.js" \
+        ! -name "*.min.css" \
+        ! -name "*.bundle.*" \
+        ! -name "*.chunk.*" \
+        ! -name "*.wasm" \
+        ! -name "*.exe" \
+        ! -name "*.dll" \
+        ! -name "*.so" \
+        ! -name "*.dylib" \
+        ! -name "*.pyc" \
+        ! -name "*.pyo" \
+        ! -name ".DS_Store" \
+        ! -name "Thumbs.db" \
+        2>/dev/null | while read -r file; do
+
+        if file "$file" 2>/dev/null | grep -q text; then
+            local rel_path="${file#$PROJECT_DIR/}"
+
+            echo "==================================================" >> "$output_file"
+            echo "FILE: $rel_path" >> "$output_file"
+            echo "==================================================" >> "$output_file"
+            echo "" >> "$output_file"
+            cat "$file" >> "$output_file" 2>/dev/null || echo "[Binary or unreadable]" >> "$output_file"
+            echo "" >> "$output_file"
+            echo "" >> "$output_file"
+        fi
+    done
+
+    log_complete "Source files collected"
+}
+
+generate_file_tree() {
+    local output_file="$1"
+
+    log_info "Generating file tree..."
+
+    {
+        echo "Project: $(get_project_name)"
+        echo "Generated: $(date)"
+        echo ""
+        tree -a -I 'node_modules|.git|dist|build|coverage|.cache|.next|.nuxt|.output|target|vendor|.venv|__pycache__|.mypy_cache|.pytest_cache|.tox|.eggs|*.egg-info|.hg|.svn|.turbo|.parcel-cache|.dart_tool|.gradle|.idea|.vscode|*.xcodeproj|*.xcworkspace|Pods|.pub-cache|.terraform|.tfstate|*.lock|*.map|*.min.js|*.min.css|*.bundle.*|*.chunk.*|*.wasm' --dirsfirst "$PROJECT_DIR" 2>/dev/null || find "$PROJECT_DIR" -type f -o -type d | grep -v -E '(node_modules|\.git|dist|build|coverage|\.cache|\.next|target|vendor|__pycache__|\.venv)' | head -500
+    } > "$output_file"
+
+    log_complete "File tree generated"
+}
+
+get_system_info() {
+    local output_file="$1"
+
+    log_info "Collecting system information..."
+
+    {
+        echo "OS: $(uname -s 2>/dev/null || echo 'Unknown')"
+        echo "Kernel: $(uname -r 2>/dev/null || echo 'Unknown')"
+        echo "Architecture: $(uname -m 2>/dev/null || echo 'Unknown')"
+        echo "Hostname: $(hostname 2>/dev/null || echo 'Unknown')"
+        echo "Shell: ${SHELL:-Unknown}"
+        echo "User: ${USER:-$(whoami 2>/dev/null || echo Unknown)}"
+        echo "Home: ${HOME:-Unknown}"
+        echo "PWD: ${PWD:-Unknown}"
+        echo ""
+
+        if [[ -f /proc/version ]] && grep -qi microsoft /proc/version 2>/dev/null; then
+            echo "WSL: Yes (Windows Subsystem for Linux)"
+            echo "WSL Version: $(grep -o 'Microsoft [^)]*' /proc/version 2>/dev/null | head -1)"
+        else
+            echo "WSL: No"
+        fi
+        echo ""
+
+        echo "=== Runtime Versions ==="
+        echo "Node: $(node --version 2>/dev/null || echo 'Not installed')"
+        echo "npm: $(npm --version 2>/dev/null || echo 'Not installed')"
+        echo "pnpm: $(pnpm --version 2>/dev/null || echo 'Not installed')"
+        echo "yarn: $(yarn --version 2>/dev/null || echo 'Not installed')"
+        echo "Bun: $(bun --version 2>/dev/null || echo 'Not installed')"
+        echo "Deno: $(deno --version 2>/dev/null | head -1 || echo 'Not installed')"
+        echo "Python: $(python3 --version 2>/dev/null || python --version 2>/dev/null || echo 'Not installed')"
+        echo "pip: $(pip3 --version 2>/dev/null || pip --version 2>/dev/null || echo 'Not installed')"
+        echo "Rust: $(rustc --version 2>/dev/null | head -1 || echo 'Not installed')"
+        echo "Cargo: $(cargo --version 2>/dev/null || echo 'Not installed')"
+        echo "Go: $(go version 2>/dev/null || echo 'Not installed')"
+        echo "Java: $(java -version 2>&1 | head -1 || echo 'Not installed')"
+        echo "PHP: $(php --version 2>/dev/null | head -1 || echo 'Not installed')"
+        echo "Ruby: $(ruby --version 2>/dev/null || echo 'Not installed')"
+        echo ".NET: $(dotnet --version 2>/dev/null || echo 'Not installed')"
+        echo ""
+
+        echo "=== Tool Versions ==="
+        echo "Git: $(git --version 2>/dev/null || echo 'Not installed')"
+        echo "Docker: $(docker --version 2>/dev/null | head -1 || echo 'Not installed')"
+        echo "Docker Compose: $(docker-compose --version 2>/dev/null || echo 'Not installed')"
+        echo "Terraform: $(terraform --version 2>/dev/null | head -1 || echo 'Not installed')"
+        echo "Make: $(make --version 2>/dev/null | head -1 || echo 'Not installed')"
+        echo "GCC: $(gcc --version 2>/dev/null | head -1 || echo 'Not installed')"
+        echo "Clang: $(clang --version 2>/dev/null | head -1 || echo 'Not installed')"
+    } > "$output_file"
+
+    log_complete "System info collected"
+}
+
+get_git_info() {
+    local output_file="$1"
+
+    log_info "Collecting git information..."
+
+    if ! command -v git &>/dev/null || [[ ! -d "$PROJECT_DIR/.git" ]]; then
+        echo "Not a git repository" > "$output_file"
+        log_warn "Not a git repository"
+        return
+    fi
+
+    {
+        echo "=== Git Status ==="
+        git -C "$PROJECT_DIR" status --short 2>/dev/null || echo "Unable to get status"
+        echo ""
+
+        echo "=== Current Branch ==="
+        git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || echo "Unable to get branch"
+        echo ""
+
+        echo "=== Remote URLs ==="
+        git -C "$PROJECT_DIR" remote -v 2>/dev/null || echo "No remotes"
+        echo ""
+
+        echo "=== Last 20 Commits ==="
+        git -C "$PROJECT_DIR" log --oneline -20 2>/dev/null || echo "No commits"
+        echo ""
+
+        echo "=== Changed Files (Staged + Unstaged) ==="
+        git -C "$PROJECT_DIR" diff --name-only HEAD 2>/dev/null || echo "None"
+        echo ""
+
+        echo "=== Untracked Files ==="
+        git -C "$PROJECT_DIR" ls-files --others --exclude-standard 2>/dev/null || echo "None"
+        echo ""
+
+        echo "=== Stash List ==="
+        git -C "$PROJECT_DIR" stash list 2>/dev/null || echo "No stashes"
+    } > "$output_file"
+
+    log_complete "Git info collected"
+}
+
+# =============================================================================
+# DOCUMENT GENERATORS
+# =============================================================================
+
+generate_ai_context() {
+    local output_file="$1"
+
+    log_info "Generating AI_CONTEXT.md..."
+
+    local project_name=$(get_project_name)
+    local languages=$(detect_language)
+    local frameworks=$(detect_framework)
+    local databases=$(detect_database)
+    local blockchain=$(detect_blockchain)
+    local testing=$(detect_testing)
+    local ai=$(detect_ai)
+    local cloud=$(detect_cloud)
+    local git_branch=$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || echo "N/A")
+    local purpose=$(get_project_purpose)
+
+    local main_folders=$(find "$PROJECT_DIR" -maxdepth 1 -type d ! -name ".*" ! -name "node_modules" ! -name "dist" ! -name "build" ! -name "target" ! -name "vendor" 2>/dev/null | xargs -I {} basename {} | tr '\n' ',' | sed 's/,$//')
+
+    local entry_points=""
+    [[ -f "index.js" ]] && entry_points+="index.js "
+    [[ -f "index.ts" ]] && entry_points+="index.ts "
+    [[ -f "main.ts" ]] && entry_points+="main.ts "
+    [[ -f "main.py" ]] && entry_points+="main.py "
+    [[ -f "app.py" ]] && entry_points+="app.py "
+    [[ -f "main.go" ]] && entry_points+="main.go "
+    [[ -f "main.rs" ]] && entry_points+="main.rs "
+    [[ -f "src/main.ts" ]] && entry_points+="src/main.ts "
+    [[ -f "src/server.ts" ]] && entry_points+="src/server.ts "
+    [[ -f "src/index.ts" ]] && entry_points+="src/index.ts "
+
+    local configs=""
+    [[ -f ".env.example" ]] && configs+=".env.example "
+    [[ -f ".env.local" ]] && configs+=".env.local "
+    [[ -f "tsconfig.json" ]] && configs+="tsconfig.json "
+    [[ -f "vite.config.ts" ]] && configs+="vite.config.ts "
+    [[ -f "next.config.js" ]] && configs+="next.config.js "
+    [[ -f "tailwind.config.js" ]] && configs+="tailwind.config.js "
+    [[ -f "eslint.config.js" ]] && configs+="eslint.config.js "
+    [[ -f "prettier.config.js" ]] && configs+="prettier.config.js "
+    [[ -f "docker-compose.yml" ]] && configs+="docker-compose.yml "
+    [[ -f "Dockerfile" ]] && configs+="Dockerfile "
+    [[ -f "hardhat.config.ts" ]] && configs+="hardhat.config.ts "
+    [[ -f "foundry.toml" ]] && configs+="foundry.toml "
+
+    local apis=""
+    [[ -d "src/routes" ]] && apis+="/api/* routes "
+    [[ -d "src/api" ]] && apis+="/api/* endpoints "
+    [[ -f "src/api.ts" ]] && apis+="API handlers "
+    [[ -d "pages/api" ]] && apis+="Next.js API routes "
+
+    local contracts=""
+    [[ -d "contracts" ]] && contracts+="contracts/ directory "
+    [[ -d "src/contracts" ]] && contracts+="src/contracts/ directory "
+    local sol_files
+    sol_files=$(find "$PROJECT_DIR" -name "*.sol" ! -path "*/node_modules/*" 2>/dev/null | head -5)
+    if [[ -n "$sol_files" ]]; then
+        contracts+="$(echo "$sol_files" | tr '\n' ' ')"
+    fi
+
+    {
+        echo "# AI Context: $project_name"
+        echo ""
+        echo "## Executive Summary"
+        echo ""
+        echo "**Project Name:** $project_name"
+        echo "**Detected Languages:** ${languages:-None detected}"
+        echo "**Frameworks:** ${frameworks:-None detected}"
+        echo "**Databases:** ${databases:-None detected}"
+        echo "**Blockchain Stack:** ${blockchain:-None detected}"
+        echo "**Testing:** ${testing:-None detected}"
+        echo "**AI/ML:** ${ai:-None detected}"
+        echo "**Cloud/Platform:** ${cloud:-None detected}"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Git Information"
+        echo ""
+        echo "- **Current Branch:** $git_branch"
+        echo "- **Checkpoint Timestamp:** $(date -Iseconds)"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Structure"
+        echo ""
+        echo "**Main Folders:** $main_folders"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Purpose"
+        echo ""
+        echo "$purpose"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Entry Points"
+        echo ""
+        echo "${entry_points:-None detected}"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Configuration Files"
+        echo ""
+        echo "${configs:-None detected}"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Detected APIs"
+        echo ""
+        echo "${apis:-None detected}"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Smart Contracts"
+        echo ""
+        echo "${contracts:-None detected}"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Package Managers"
+        echo ""
+        local pkg_managers=""
+        [[ -f "package.json" ]] && pkg_managers+="npm/yarn/pnpm "
+        [[ -f "Cargo.toml" ]] && pkg_managers+="Cargo "
+        [[ -f "go.mod" ]] && pkg_managers+="Go modules "
+        [[ -f "requirements.txt" ]] && pkg_managers+="pip "
+        [[ -f "pyproject.toml" ]] && pkg_managers+="poetry/pip "
+        [[ -f "composer.json" ]] && pkg_managers+="Composer "
+        [[ -f "pom.xml" ]] && pkg_managers+="Maven "
+        echo "${pkg_managers:-None detected}"
+        echo ""
+    } > "$output_file"
+
+    log_complete "AI_CONTEXT.md generated"
+}
+
+generate_project_status() {
+    local output_file="$1"
+
+    log_info "Generating PROJECT_STATUS.md..."
+
+    local total_files=$(find "$PROJECT_DIR" -type f ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/dist/*" ! -path "*/build/*" 2>/dev/null | wc -l)
+    local total_dirs=$(find "$PROJECT_DIR" -type d ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/dist/*" ! -path "*/build/*" 2>/dev/null | wc -l)
+
+    local ts_files=$(find "$PROJECT_DIR" \( -name "*.ts" -o -name "*.tsx" \) ! -path "*/node_modules/*" ! -path "*/dist/*" 2>/dev/null | wc -l)
+    local js_files=$(find "$PROJECT_DIR" \( -name "*.js" -o -name "*.jsx" \) ! -path "*/node_modules/*" ! -path "*/dist/*" 2>/dev/null | wc -l)
+    local py_files=$(find "$PROJECT_DIR" -name "*.py" ! -path "*/__pycache__/*" ! -path "*/.venv/*" 2>/dev/null | wc -l)
+    local rs_files=$(find "$PROJECT_DIR" -name "*.rs" ! -path "*/target/*" 2>/dev/null | wc -l)
+    local go_files=$(find "$PROJECT_DIR" -name "*.go" ! -path "*/vendor/*" 2>/dev/null | wc -l)
+
+    {
+        echo "# Project Status Report"
+        echo ""
+        echo "**Generated:** $(date)"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## File Statistics"
+        echo ""
+        echo "- **Total Files:** $total_files"
+        echo "- **Total Directories:** $total_dirs"
+        echo "- **TypeScript Files:** $ts_files"
+        echo "- **JavaScript Files:** $js_files"
+        echo "- **Python Files:** $py_files"
+        echo "- **Rust Files:** $rs_files"
+        echo "- **Go Files:** $go_files"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Completed Modules"
+        echo ""
+        echo "Detected from project structure:"
+        echo ""
+        find "$PROJECT_DIR" -maxdepth 3 -type d \( -name "src" -o -name "lib" -o -name "components" -o -name "pages" -o -name "routes" -o -name "services" -o -name "models" -o -name "controllers" -o -name "hooks" -o -name "utils" -o -name "helpers" -o -name "middleware" -o -name "api" -o -name "contracts" -o -name "tests" -o -name "__tests__" \) ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/dist/*" 2>/dev/null | while read -r dir; do
+            local rel="${dir#$PROJECT_DIR/}"
+            local file_count=$(find "$dir" -type f 2>/dev/null | wc -l)
+            echo "- **$rel** ($file_count files)"
+        done
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Existing APIs"
+        echo ""
+        echo "Detected from route/handler files:"
+        echo ""
+        find "$PROJECT_DIR" \( -name "*route*" -o -name "*handler*" -o -name "*controller*" -o -name "*api*" \) -type f ! -path "*/node_modules/*" ! -path "*/dist/*" 2>/dev/null | head -20 | while read -r f; do
+            local rel="${f#$PROJECT_DIR/}"
+            echo "- $rel"
+        done
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Database Status"
+        echo ""
+        local db=$(detect_database)
+        if [[ -n "$db" ]]; then
+            echo "**Detected:** $db"
+            echo ""
+            if [[ -d "migrations" ]]; then
+                echo "**Migrations:** $(ls -1 migrations 2>/dev/null | wc -l) files"
+            fi
+            if [[ -f "prisma/schema.prisma" ]]; then
+                echo "**Prisma Models:** $(grep -c 'model ' prisma/schema.prisma 2>/dev/null || echo 0)"
+            fi
+        else
+            echo "No database detected"
+        fi
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Build Status"
+        echo ""
+        if [[ -f "package.json" ]]; then
+            echo "**Node.js project detected**"
+            echo "- Run: \`npm run build\` to verify"
+        fi
+        if [[ -f "Cargo.toml" ]]; then
+            echo "**Rust project detected**"
+            echo "- Run: \`cargo build\` to verify"
+        fi
+        if [[ -f "go.mod" ]]; then
+            echo "**Go project detected**"
+            echo "- Run: \`go build\` to verify"
+        fi
+        if [[ -f "pyproject.toml" ]] || [[ -f "setup.py" ]]; then
+            echo "**Python project detected**"
+            echo "- Run: \`python setup.py build\` or \`pip install -e .\` to verify"
+        fi
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Git Status"
+        echo ""
+        if [[ -d ".git" ]]; then
+            echo "- **Branch:** $(git branch --show-current 2>/dev/null || echo N/A)"
+            echo "- **Modified Files:** $(git status --porcelain 2>/dev/null | grep -c '^[MA]' || echo 0)"
+            echo "- **Untracked Files:** $(git status --porcelain 2>/dev/null | grep -c '^??' || echo 0)"
+            echo "- **Last Commit:** $(git log -1 --oneline 2>/dev/null || echo N/A)"
+        else
+            echo "Not a git repository"
+        fi
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Recent Commits"
+        echo ""
+        git log --oneline -10 2>/dev/null || echo "No commits"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Potential TODOs"
+        echo ""
+        echo "Detected from source comments:"
+        echo ""
+        grep -r "TODO\|FIXME\|HACK\|XXX" --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.py" --include="*.rs" --include="*.go" "$PROJECT_DIR" 2>/dev/null | head -20 | while read -r line; do
+            local file=$(echo "$line" | cut -d: -f1)
+            local rel="${file#$PROJECT_DIR/}"
+            local todo=$(echo "$line" | grep -o 'TODO\|FIXME\|HACK\|XXX[^"]*' | head -1)
+            echo "- $rel: $todo"
+        done || true
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Known Warnings"
+        echo ""
+        echo "Check for:"
+        echo "- TypeScript strict mode issues: \`npx tsc --noEmit\`"
+        echo "- ESLint warnings: \`npm run lint\`"
+        echo "- Python type issues: \`mypy .\`"
+        echo "- Rust clippy warnings: \`cargo clippy\`"
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Detected Environment Variables"
+        echo ""
+        if [[ -f ".env.example" ]]; then
+            grep -v '^#' .env.example 2>/dev/null | grep '=' | while read -r line; do
+                local var=$(echo "$line" | cut -d= -f1)
+                echo "- $var"
+            done || true
+        else
+            echo "No .env.example found"
+        fi
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Pending Implementations"
+        echo ""
+        echo "Inferred from empty/stub files and TODOs:"
+        echo ""
+        find "$PROJECT_DIR" -type f \( -name "*.ts" -o -name "*.js" -o -name "*.py" \) ! -path "*/node_modules/*" ! -path "*/dist/*" 2>/dev/null | while read -r f; do
+            if grep -q "TODO\|FIXME\|not implemented\|throw new Error" "$f" 2>/dev/null; then
+                local rel="${f#$PROJECT_DIR/}"
+                echo "- $rel"
+            fi
+        done
+        echo ""
+    } > "$output_file"
+
+    log_complete "PROJECT_STATUS.md generated"
+}
+
+generate_handoff_prompt() {
+    local output_file="$1"
+
+    log_info "Generating HANDOFF_PROMPT.md..."
+
+    local project_name=$(get_project_name)
+
+    {
+        echo "# AI Handoff Prompt"
+        echo ""
+        echo "You are continuing an existing software project: **$project_name**"
+        echo ""
+        echo "## Critical Instructions"
+        echo ""
+        echo "1. **Read everything** inside the AI_CHECKPOINT directory before writing any code."
+        echo "2. **Treat the current implementation as the source of truth.**"
+        echo "3. **Do NOT redesign the architecture.**"
+        echo "4. **Do NOT rename files or reorganize the project structure.**"
+        echo "5. **Do NOT rewrite working code.**"
+        echo "6. **Preserve all business logic, APIs, IDs, database formats, and event systems.**"
+        echo "7. **Only implement the specific features requested.**"
+        echo "8. **Maintain backward compatibility with existing data and APIs.**"
+        echo "9. **Follow the existing coding patterns and style.**"
+        echo "10. **Test your changes don't break existing functionality.**"
+        echo ""
+        echo "## Before Coding"
+        echo ""
+        echo "1. Read \`AI_CONTEXT.md\` to understand the project overview."
+        echo "2. Read \`PROJECT_STATUS.md\` to understand current state."
+        echo "3. Read \`FILE_TREE.txt\` to understand the structure."
+        echo "4. Read relevant source files in \`PROJECT_DUMP.txt\`."
+        echo "5. Summarize your understanding of the relevant modules."
+        echo "6. Identify potential risks or breaking changes."
+        echo "7. Ask only if critical information is missing for the task."
+        echo ""
+        echo "## Architecture Constraints"
+        echo ""
+        echo "- **Database:** Do not introduce new ORMs or migration frameworks unless explicitly requested."
+        echo "- **State Management:** Preserve existing state patterns (Redux, Zustand, Context, etc.)."
+        echo "- **API Contracts:** Do not change request/response formats."
+        echo "- **IDs:** Do not change ID formats or generation methods."
+        echo "- **Event Systems:** Preserve event types and payloads."
+        echo "- **Error Handling:** Follow existing error handling patterns."
+        echo ""
+        echo "## Code Quality Requirements"
+        echo ""
+        echo "- Match existing code style (indentation, naming, etc.)."
+        echo "- Add appropriate TypeScript types (if applicable)."
+        echo "- Include necessary error handling."
+        echo "- Add comments for complex logic."
+        echo "- Do not add unnecessary dependencies."
+        echo ""
+        echo "## Testing"
+        echo ""
+        echo "- If tests exist, ensure new code passes existing tests."
+        echo "- Add tests for new functionality if testing framework is detected."
+        echo "- Do not remove or skip existing tests."
+        echo ""
+        echo "## What NOT to Do"
+        echo ""
+        echo "- ❌ Do not convert between frameworks (e.g., JavaScript to TypeScript, Express to NestJS)"
+        echo "- ❌ Do not add new state management libraries"
+        echo "- ❌ Do not change the database schema without explicit request"
+        echo "- ❌ Do not refactor \"for better practices\" unless asked"
+        echo "- ❌ Do not add new API endpoints unless asked"
+        echo "- ❌ Do not change existing API response formats"
+        echo "- ❌ Do not remove existing features or configurations"
+        echo ""
+        echo "## What TO Do"
+        echo ""
+        echo "- ✅ Make minimal, surgical changes"
+        echo "- ✅ Follow existing patterns exactly"
+        echo "- ✅ Preserve all existing functionality"
+        echo "- ✅ Test your changes thoroughly"
+        echo "- ✅ Explain your reasoning before significant changes"
+        echo "- ✅ Ask if unclear about requirements"
+        echo ""
+    } > "$output_file"
+
+    log_complete "HANDOFF_PROMPT.md generated"
+}
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+main() {
+    print_header
+
+    TIMESTAMP=$(get_timestamp)
+    CHECKPOINT_DIR="$PROJECT_DIR/AI_CHECKPOINT/$TIMESTAMP"
+
+    log_info "Project directory: $PROJECT_DIR"
+    log_info "Checkpoint directory: $CHECKPOINT_DIR"
+    echo ""
+
+    safe_mkdir "$CHECKPOINT_DIR"
+
+    generate_ai_context "$CHECKPOINT_DIR/AI_CONTEXT.md"
+    generate_project_status "$CHECKPOINT_DIR/PROJECT_STATUS.md"
+    collect_source_files "$CHECKPOINT_DIR/PROJECT_DUMP.txt"
+    get_system_info "$CHECKPOINT_DIR/SYSTEM_INFO.txt"
+    get_git_info "$CHECKPOINT_DIR/GIT_INFO.txt"
+    generate_file_tree "$CHECKPOINT_DIR/FILE_TREE.txt"
+    generate_handoff_prompt "$CHECKPOINT_DIR/HANDOFF_PROMPT.md"
+
+    echo ""
+    echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}                ${WHITE}AI Checkpoint Complete${NC}                     ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}                                                              ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}  ${CYAN}Location:${NC}    AI_CHECKPOINT/$TIMESTAMP/                        ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}                                                              ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}  ${CYAN}Files:${NC}                                                            ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}    ${GRAY}✓ AI_CONTEXT.md${NC}         - Project overview              ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}    ${GRAY}✓ PROJECT_STATUS.md${NC}     - Current status               ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}    ${GRAY}✓ PROJECT_DUMP.txt${NC}      - Complete source dump         ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}    ${GRAY}✓ SYSTEM_INFO.txt${NC}       - System information           ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}    ${GRAY}✓ GIT_INFO.txt${NC}          - Git status                  ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}    ${GRAY}✓ FILE_TREE.txt${NC}         - Directory structure          ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}    ${GRAY}✓ HANDOFF_PROMPT.md${NC}     - Reusable AI prompt           ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}║${NC}                                                              ${BOLD}${GREEN}║${NC}"
+    echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+main "$@"
+
+
+==================================================
+FILE: scripts/create-sepolia-wallet.ts
+==================================================
+
+import "dotenv/config";
+import { initiateDeveloperControlledWalletsClient } from "@circle-fin/developer-controlled-wallets";
+
+/**
+ * Creates a second developer-controlled wallet, on Ethereum Sepolia,
+ * within the SAME wallet set as the existing Arc Treasury wallet — so
+ * it shares the same entity secret rather than provisioning a whole new
+ * wallet set. Needed because Circle wallets are chain-specific: the Arc
+ * wallet can't sign on Sepolia.
+ *
+ * Usage: npx tsx scripts/create-sepolia-wallet.ts
+ */
+
+async function main() {
+  const apiKey = process.env.CIRCLE_API_KEY;
+  const entitySecret = process.env.CIRCLE_ENTITY_SECRET;
+  const walletSetId = process.env.CIRCLE_WALLET_SET_ID; // existing set, e.g. 14b32ac9-...
+
+  if (!apiKey || !entitySecret || !walletSetId) {
+    console.error("Missing CIRCLE_API_KEY / CIRCLE_ENTITY_SECRET / CIRCLE_WALLET_SET_ID in .env");
+    process.exit(1);
+  }
+
+  const client = initiateDeveloperControlledWalletsClient({ apiKey, entitySecret });
+
+  const walletResponse = await client.createWallets({
+    walletSetId,
+    blockchains: ["ETH-SEPOLIA"],
+    count: 1,
+    accountType: "EOA",
+  });
+
+  console.log("Wallet response:", JSON.stringify(walletResponse.data, null, 2));
+
+  const wallet = walletResponse.data?.wallets?.[0];
+  if (wallet) {
+    console.log(`\n✅ Created Sepolia wallet:`);
+    console.log(`   Wallet ID: ${wallet.id}`);
+    console.log(`   Address:   ${wallet.address}`);
+    console.log(`\nAdd to .env:`);
+    console.log(`   SEPOLIA_WALLET_ID=${wallet.id}`);
+    console.log(`\nThen fund ${wallet.address} with Sepolia ETH from a faucet (e.g. sepoliafaucet.com) for gas.`);
+  }
+}
+
+main().catch((err) => {
+  console.error("Error:", err.message || err);
+  process.exit(1);
+});
+
+
+==================================================
+FILE: scripts/registerAgents.ts
+==================================================
+
+import { ethers } from "hardhat";
+
+/**
+ * Registers both agents' on-chain identities against the existing,
+ * already-deployed AgentIdentity (ERC-8004) registry from ConstructOS:
+ *   0x3EC9Cd867B9Eaf94380bc8a20EEcC27E02AC2812
+ *
+ * NOTE: the original construct-os-v2 deploy.ts deployed AgentIdentity
+ * but never actually called registerAgent() — INSPECTOR_AGENT_ADDRESS
+ * was just an address convention, not a real registration. This script
+ * performs the real registerAgent() call for both agents, so BuildFi's
+ * two agents each have a genuine on-chain identity record (metadata URI
+ * + initialized reputation), not just an address people call "the agent".
+ *
+ * Required env vars:
+ *   RPC_URL, PRIVATE_KEY              - deployer/registrant wallet
+ *   CONTRACT_IDENTITY                 - AgentIdentity registry address
+ *   INSPECTOR_AGENT_ADDRESS           - Inspector Agent's wallet address
+ *   TREASURY_AGENT_ADDRESS            - Treasury Agent's wallet address
+ *                                       (Circle Developer-Controlled Wallet)
+ *   INSPECTOR_METADATA_URI            - e.g. raw GitHub URL to
+ *                                       metadata/inspector-agent.json
+ *   TREASURY_METADATA_URI             - e.g. raw GitHub URL to
+ *                                       metadata/treasury-agent.json
+ */
+
+const AGENT_IDENTITY_ABI = [
+  "function registerAgent(address agent, string calldata metadataURI) external",
+  "function getReputation(address agent) external view returns (uint8)",
+  "function metadata(address agent) external view returns (string)",
+];
+
+async function main() {
+  const [signer] = await ethers.getSigners();
+  console.log("Registering from:", signer.address);
+
+  const identityAddress = process.env.CONTRACT_IDENTITY;
+  if (!identityAddress) throw new Error("Missing CONTRACT_IDENTITY in .env");
+
+  const identity = new ethers.Contract(identityAddress, AGENT_IDENTITY_ABI, signer);
+
+  const agents: Array<{ label: string; envAddr: string; envUri: string }> = [
+    {
+      label: "Inspector Agent",
+      envAddr: "INSPECTOR_AGENT_ADDRESS",
+      envUri: "INSPECTOR_METADATA_URI",
+    },
+    {
+      label: "Treasury Agent",
+      envAddr: "TREASURY_AGENT_ADDRESS",
+      envUri: "TREASURY_METADATA_URI",
+    },
+  ];
+
+  for (const agent of agents) {
+    const address = process.env[agent.envAddr];
+    const metadataURI = process.env[agent.envUri];
+
+    if (!address || !metadataURI) {
+      console.log(`Skipping ${agent.label}: missing ${agent.envAddr} or ${agent.envUri}`);
+      continue;
+    }
+
+    console.log(`\nRegistering ${agent.label} (${address})`);
+    console.log(`  metadataURI: ${metadataURI}`);
+
+    const tx = await identity.registerAgent(address, metadataURI);
+    console.log(`  tx sent: ${tx.hash}`);
+    const receipt = await tx.wait();
+    console.log(`  confirmed in block ${receipt?.blockNumber}`);
+
+    const reputation = await identity.getReputation(address);
+    console.log(`  reputation: ${reputation}`);
+  }
+
+  console.log("\nDone. Verify on explorer: https://testnet.arcscan.app/address/" + identityAddress);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
+
+
+==================================================
+FILE: scripts/test-cctp-mint.ts
+==================================================
+
+import "dotenv/config";
+import { fetchAttestation, mintOnDestination } from "../agent/cctp";
+
+/**
+ * Isolated test for attestation polling + destination mint, given a
+ * burn tx hash from test-cctp-burn.ts. Run this second, once the burn
+ * is confirmed.
+ *
+ * Usage:
+ *   npx tsx scripts/test-cctp-mint.ts <sourceTxHash>
+ */
+
+async function main() {
+  const [sourceTxHash] = process.argv.slice(2);
+
+  if (!sourceTxHash) {
+    console.error("Usage: npx tsx scripts/test-cctp-mint.ts <sourceTxHash>");
+    process.exit(1);
+  }
+
+  console.log(`Polling Iris for attestation of ${sourceTxHash}...`);
+  console.log("This can take 1-3 minutes for standard (non-fast) transfers.\n");
+
+  const attestation = await fetchAttestation(sourceTxHash);
+
+  if (!attestation) {
+    console.log("❌ No attestation received after poll window. Try again in a minute, or check the tx confirmed on Arc first.");
+    process.exit(1);
+  }
+
+  console.log("✅ Attestation received. Submitting mint on Sepolia...\n");
+
+  const result = await mintOnDestination(attestation.message, attestation.attestation);
+
+  console.log("\nResult:", result);
+
+  if (result.status === "confirmed") {
+    console.log(`\n✅ Mint confirmed. txHash: ${result.txHash}`);
+    console.log(`Verify on explorer: https://sepolia.etherscan.io/tx/${result.txHash}`);
+    console.log(`\nFull cross-chain settlement complete: Arc -> Sepolia via CCTP V2.`);
+  } else {
+    console.log(`\n❌ Mint failed: ${result.reason}`);
+  }
+}
+
+main().catch((err) => {
+  console.error("Unexpected error:", err);
+  process.exit(1);
+});
+
+
+==================================================
+FILE: scripts/test-cctp-burn.ts
+==================================================
+
+import "dotenv/config";
+import { burnOnArc } from "../agent/cctp";
+
+/**
+ * Isolated test for the CCTP burn leg only. Run this BEFORE wiring CCTP
+ * into Treasury Agent's real flow — it's the step most likely to reveal
+ * whether createContractExecutionTransaction's parameter shape matches
+ * the installed Circle SDK version.
+ *
+ * Usage:
+ *   npx tsx scripts/test-cctp-burn.ts <amountUsdc> <destinationAddress>
+ *
+ * Example:
+ *   npx tsx scripts/test-cctp-burn.ts 1.00 0xYourTestAddressOnSepolia
+ */
+
+async function main() {
+  const [amount, destination] = process.argv.slice(2);
+
+  if (!amount || !destination) {
+    console.error("Usage: npx tsx scripts/test-cctp-burn.ts <amountUsdc> <destinationAddress>");
+    process.exit(1);
+  }
+
+  console.log(`Testing CCTP burn: ${amount} USDC -> ${destination} on Sepolia`);
+  console.log("This will call approve() then depositForBurn() on Arc Testnet via Circle's contract-execution API.\n");
+
+  const result = await burnOnArc(amount, destination);
+
+  console.log("\nResult:", result);
+
+  if (result.status === "confirmed") {
+    console.log(`\n✅ Burn confirmed. txHash: ${result.txHash}`);
+    console.log(`Verify on explorer: https://testnet.arcscan.app/tx/${result.txHash}`);
+    console.log(`\nNext: run scripts/test-cctp-mint.ts with this txHash once Iris has attested it (usually 1-3 min).`);
+  } else {
+    console.log(`\n❌ Burn failed: ${result.reason}`);
+    console.log(`If this is a parameter/ABI error, check the exact createContractExecutionTransaction shape against your installed SDK's type definitions:`);
+    console.log(`  node -e "console.log(require('@circle-fin/developer-controlled-wallets'))"`);
+  }
+}
+
+main().catch((err) => {
+  console.error("Unexpected error:", err);
+  process.exit(1);
+});
+
+
+==================================================
+FILE: data/treasury-state.json
+==================================================
+
+{
+  "projectBudgetTotal": 90000,
+  "projectBudgetRemaining": 89998,
+  "settlements": [
+    {
+      "milestoneId": "0a3917bebbc2fa714c2be8fe4d21f2267e96e7d4698b38db914fbf4010c680cc",
+      "contractorAddress": "0xFFD3347ca0C3Ba5a104Ed9113C1d7F65d0C85a8A",
+      "amount": 2,
+      "txHash": "0x01f09b81df0acdd5b6ec03c1bf35928a739215b1a6a3421c5f3f712eb44bcd04",
+      "settledAt": "2026-08-02T17:38:03.363Z"
+    }
+  ]
+}
+
+==================================================
+FILE: tsconfig.json
+==================================================
+
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": "dist"
+  },
+  "include": ["scripts", "hardhat.config.ts"]
+}
+
+
+==================================================
+FILE: metadata/inspector-agent.json
+==================================================
+
+{
+  "name": "ConstructOS Inspector Agent",
+  "role": "inspector",
+  "description": "Autonomous multi-oracle inspection agent. Detects ProofSubmitted events on ConstructionEscrow, runs vision/GPS/drone oracle verification, and emits a verified-milestone signal.",
+  "project": "BuildFi",
+  "capabilities": ["oracle-verification", "milestone-attestation"],
+  "contracts": {
+    "escrow": "0x1D4dB36a97aFf39e93071C45A1944864d6A8E70D",
+    "identityRegistry": "0x3EC9Cd867B9Eaf94380bc8a20EEcC27E02AC2812"
+  }
+}
+
+
+==================================================
+FILE: metadata/treasury-agent.json
+==================================================
+
+{
+  "name": "BuildFi Treasury Agent",
+  "role": "treasury",
+  "description": "Autonomous treasury agent. Holds a Circle Developer-Controlled (Agent) Wallet, watches for verified-milestone signals from the Inspector Agent, runs a risk check against project budget/burn-rate, and autonomously settles USDC payment on Arc Testnet.",
+  "project": "BuildFi",
+  "capabilities": ["risk-assessment", "autonomous-usdc-settlement", "agent-wallet"],
+  "contracts": {
+    "escrow": "0x1D4dB36a97aFf39e93071C45A1944864d6A8E70D",
+    "identityRegistry": "0x3EC9Cd867B9Eaf94380bc8a20EEcC27E02AC2812"
+  }
+}
+
+
+==================================================
+FILE: ai-checkpoint.sh:Zone.Identifier
+==================================================
+
+[ZoneTransfer]
+ZoneId=3 
+
+==================================================
+FILE: frontend/package-lock.json
+==================================================
+
+{
+  "name": "buildfi-frontend",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "buildfi-frontend",
+      "version": "0.0.0",
+      "dependencies": {
+        "react": "^19.2.7",
+        "react-dom": "^19.2.7"
+      },
+      "devDependencies": {
+        "@types/node": "^24.13.2",
+        "@types/react": "^19.2.17",
+        "@types/react-dom": "^19.2.3",
+        "@vitejs/plugin-react": "^6.0.3",
+        "oxlint": "^1.71.0",
+        "typescript": "~6.0.2",
+        "vite": "^8.1.1"
+      }
+    },
+    "node_modules/@emnapi/core": {
+      "version": "2.0.0-alpha.3",
+      "resolved": "https://registry.npmjs.org/@emnapi/core/-/core-2.0.0-alpha.3.tgz",
+      "integrity": "sha512-AZypUeJ/yByuxyS7BlSNRDOMLMlROYtjYdIAuBmJssVz1UJDSeYxLrdizhXCFYhedC5bqd/ASy8EuNXbVVXp9g==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "peer": true,
+      "dependencies": {
+        "@emnapi/wasi-threads": "2.0.1",
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@emnapi/runtime": {
+      "version": "2.0.0-alpha.3",
+      "resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-2.0.0-alpha.3.tgz",
+      "integrity": "sha512-hFPAhMUjJD9BSyCANEISPOogeXC9Zo9ZQl7L6vKnaVsMkCtzznaW/naYypeyl0Gv5rYfWYsZbpixTMpjDJzQeA==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "peer": true,
+      "dependencies": {
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@emnapi/wasi-threads": {
+      "version": "2.0.1",
+      "resolved": "https://registry.npmjs.org/@emnapi/wasi-threads/-/wasi-threads-2.0.1.tgz",
+      "integrity": "sha512-9DsSk+o5NBX0CCJT8s0EROGSGxjR/tKu6aBTaVyq+SjAEQH4XcdcRxPBRzsBLizTTJ49MJjF+jgu3qnO9GLQcQ==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "peer": true,
+      "dependencies": {
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@napi-rs/wasm-runtime": {
+      "version": "1.2.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/wasm-runtime/-/wasm-runtime-1.2.0.tgz",
+      "integrity": "sha512-kDoONqMa+VnZ4vvvu/ZUurpJ4gkZU57e7g69qpNgWhYcZFPUHZM2CEMKm+cG6ufDVALbjMvfmMjFVqaK7uEMnA==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "@tybys/wasm-util": "^0.10.3"
+      },
+      "engines": {
+        "node": "^20.19.0 || ^22.13.0 || >=23.5.0"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      },
+      "peerDependencies": {
+        "@emnapi/core": "^2.0.0-alpha.3",
+        "@emnapi/runtime": "^2.0.0-alpha.3"
+      }
+    },
+    "node_modules/@oxc-project/types": {
+      "version": "0.139.0",
+      "resolved": "https://registry.npmjs.org/@oxc-project/types/-/types-0.139.0.tgz",
+      "integrity": "sha512-r9gHphtCs+1M7J0pw6Sn/hh/Wpa/iQrOOkrNAlVLF/gHq+/CJmHIWKKUUhdWjcD6CIa8idarspCsASiXCXvFUw==",
+      "dev": true,
+      "license": "MIT",
+      "funding": {
+        "url": "https://github.com/sponsors/Boshen"
+      }
+    },
+    "node_modules/@oxlint/binding-android-arm-eabi": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-android-arm-eabi/-/binding-android-arm-eabi-1.76.0.tgz",
+      "integrity": "sha512-ZHIE5Zt9AsPDcY4nOlofXt0YfneEeo+QrKMPcPzLf2Z6Q8VtV2W73d7SFJ920WUwyik783u/doKCs3KXdwG+7w==",
+      "cpu": [
+        "arm"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "android"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-android-arm64": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-android-arm64/-/binding-android-arm64-1.76.0.tgz",
+      "integrity": "sha512-shm/ngQilHK6bs+ElJWa4oHfNj5vL1Gl/iVEJldTQjpr0/67oSgr0KUpbmcnLig5Fo0v/l6j2567A7TOL89ONA==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "android"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-darwin-arm64": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-darwin-arm64/-/binding-darwin-arm64-1.76.0.tgz",
+      "integrity": "sha512-rvJmrAPKSQ9aWJ6wIS6CK2tJjwzfW0ApQH9qokq6sfDvmHwoyIHxHFMq7z7i7GiV6fdE6s8qvBqWKPTu8RmT6Q==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-darwin-x64": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-darwin-x64/-/binding-darwin-x64-1.76.0.tgz",
+      "integrity": "sha512-U/zYdb7VYKGY6pA9Vd2rYl9O/HlCylcOlb5PGPvVLtg+oLGsk6H3XGKEMHKyqD3nmmtmlmwb/8SwU2vfSAtvMw==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-freebsd-x64": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-freebsd-x64/-/binding-freebsd-x64-1.76.0.tgz",
+      "integrity": "sha512-WvKG9CAriuo0XNiFzpXjDngUZcRGFNpaK2kLyMUsnJlShxkT96u+BpJQ3KqdQwGOrvI14L6V8bAwXwAYNNY6Jg==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "freebsd"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-linux-arm-gnueabihf": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-linux-arm-gnueabihf/-/binding-linux-arm-gnueabihf-1.76.0.tgz",
+      "integrity": "sha512-qJ5+RH99TqFRq3UCDxkW0zJJu9c+OAHFY72vGlxZLEpuO+MpKo3POgqb8sYipL9KYm8XY6ofb0HsOuvY6hQNqQ==",
+      "cpu": [
+        "arm"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-linux-arm-musleabihf": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-linux-arm-musleabihf/-/binding-linux-arm-musleabihf-1.76.0.tgz",
+      "integrity": "sha512-PvPCVptkgVARsucgIqFQQcSmJ6xc6GtnVB5bRBekRahTc9eObMtjHfMjy5M+C2tHt5UCMttWM9RuSk/H9NqYeg==",
+      "cpu": [
+        "arm"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-linux-arm64-gnu": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.76.0.tgz",
+      "integrity": "sha512-3KeFDx8Bu4HPAXbuHZOr/oHvN+QT+JQhMw/NYPz7Z071xLSsG27Jfh9PIQVEY7hk1I+jr43ExqRIeJ6VKk2yLw==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-linux-arm64-musl": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-linux-arm64-musl/-/binding-linux-arm64-musl-1.76.0.tgz",
+      "integrity": "sha512-oPFkkKTgl0K/EIg9fQ8oA3IGcI05/Mq1en04iFa41mmNPT+6KEiByVazTOZZJiHMBBrbsns1YJ2e1Scqwzesjw==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-linux-ppc64-gnu": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-linux-ppc64-gnu/-/binding-linux-ppc64-gnu-1.76.0.tgz",
+      "integrity": "sha512-gN7yZ0eqflA5Fhf1wvHxGUltIV3FsvmB1zhNMDEK9vSHhc7E6qg9CuPeBgPZab66Tjzq6w6kHAtNEvnTHf4cyw==",
+      "cpu": [
+        "ppc64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-linux-riscv64-gnu": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-linux-riscv64-gnu/-/binding-linux-riscv64-gnu-1.76.0.tgz",
+      "integrity": "sha512-S/HqMbn22mQrjtErUxEoS/a55u8kIeXvreIxiJu5G7Le3UecEd6SQZxrDIpuhtgaFnsY/nVra3ytP+pRljDilA==",
+      "cpu": [
+        "riscv64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-linux-riscv64-musl": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-linux-riscv64-musl/-/binding-linux-riscv64-musl-1.76.0.tgz",
+      "integrity": "sha512-ZIga3097VJZolGZk6SrIAUokIGfRkxRlhiHDUznZptGBfwrhD7pNfD1rzEzsCwvk/1DX0A1bLz+liuNh5QKIVQ==",
+      "cpu": [
+        "riscv64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-linux-s390x-gnu": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-linux-s390x-gnu/-/binding-linux-s390x-gnu-1.76.0.tgz",
+      "integrity": "sha512-ZGiiA7pFzMJSyMWYZTVlPgbTsx+Vl8ihLGMIujPwaslUF7kIPPWAbVmAlTc+9lWDV+DCiB8Ikixu+lSHeOIIWQ==",
+      "cpu": [
+        "s390x"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-linux-x64-gnu": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.76.0.tgz",
+      "integrity": "sha512-JLiy5WuvEBFTT6ErIFV35SLzi0R7Iri6MKU6dZbTxfIx8pndbbPs3Mj780nMipBFcPkti+okAPOJ9POKkHFEgg==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-linux-x64-musl": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-linux-x64-musl/-/binding-linux-x64-musl-1.76.0.tgz",
+      "integrity": "sha512-z7lgKQtbo/I1NIe8G5NHLesxJDv0tRSUWTpXKb9Pm3E9nKFKfO4IOSDtFroKgXtOYb0jQbcdH+0wzTyMXVes+A==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-openharmony-arm64": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-openharmony-arm64/-/binding-openharmony-arm64-1.76.0.tgz",
+      "integrity": "sha512-JOjKymIpb9QcYfEhZsN6h4V9Ivd474W38cNIBRv6bg2TbIvogbMTH0Mg6YWW9TiRDqfcX+/Hyfsbo5vcSE5guQ==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "openharmony"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-win32-arm64-msvc": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.76.0.tgz",
+      "integrity": "sha512-pqDWZiwcmByWUEm1NFUBNiT6aentCcaoMWJv0HbXEmuYermJ4sg8ppVrshubYP2MZ6SHccJJcpr6x469PuDFIw==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-win32-ia32-msvc": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-win32-ia32-msvc/-/binding-win32-ia32-msvc-1.76.0.tgz",
+      "integrity": "sha512-Ba0O659kgMv6pwO3z9PdO+K3aMxQRaw9HnG+e6AtOfgwcKFvYilciQYBoUBmxfQvOCKZe1SwjMkuB542NkuDMQ==",
+      "cpu": [
+        "ia32"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@oxlint/binding-win32-x64-msvc": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/@oxlint/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.76.0.tgz",
+      "integrity": "sha512-5qcirPHO8nKfkoowEVWtpAoVTcYDy6g0UT0NGic450Qv8J2NrOqg4uQ8QppRP4MDTC7Xx47lbZnmadTH03CGGA==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-android-arm64": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-android-arm64/-/binding-android-arm64-1.1.5.tgz",
+      "integrity": "sha512-lZg8fqIv2v7FF237bwMgzGZEJvGL79/s5knJ/i6FmsGF4XXlzccZ4jb+TrFIxtSSxFtIpdsgrPZeMk1I9AFcyQ==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "android"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-darwin-arm64": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-darwin-arm64/-/binding-darwin-arm64-1.1.5.tgz",
+      "integrity": "sha512-51Bnx9pNiMRKSUNtBfySkNJ9vMU9Hh3I1ozDd6gyPPYzaXCfnptUcEZxXGYFn+ul2dtcMUiqGR1Yai2K10uoTw==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-darwin-x64": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-darwin-x64/-/binding-darwin-x64-1.1.5.tgz",
+      "integrity": "sha512-Tm+gbfC0aHu1tBA/JvKQh32S0K6YgCHkiAF4/W6xX0K0RmNuc94VeK419dJoE65R5aRxmo+noZQSWrAMF6yb6g==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-freebsd-x64": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-freebsd-x64/-/binding-freebsd-x64-1.1.5.tgz",
+      "integrity": "sha512-JMzDKCCXq93YccG5gz3hvOs1oXRKAf0XYpfOS88e+wZrC8Iugj6j68867vrYZkvpDDpKn/KoKORThmchMpF6TA==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "freebsd"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-arm-gnueabihf": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm-gnueabihf/-/binding-linux-arm-gnueabihf-1.1.5.tgz",
+      "integrity": "sha512-uML21j2K5TfPGutKxub+M+nLjZIrWjXQ5Grx4lCe/nimTj9B4L63zHpjXLl4y0L3mcm2htEQIb06oCG/szerNw==",
+      "cpu": [
+        "arm"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-arm64-gnu": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm64-gnu/-/binding-linux-arm64-gnu-1.1.5.tgz",
+      "integrity": "sha512-navSiuTMogvnQoZoM/v+l3ZWo50/NTwSHSzheABx/RCnmUPaKwq9qSo4Br2OYRs21+Fz8uFqITZM3H4opOB0/Q==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-arm64-musl": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-arm64-musl/-/binding-linux-arm64-musl-1.1.5.tgz",
+      "integrity": "sha512-lAryqH7IteztmCXQXk0etKj4wBQ7Gx5S6LjKhsgp9zb8I5bsuvU/2llH1hDQcjsFeqIsovMVN339/8pUDDBXxA==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-ppc64-gnu": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-ppc64-gnu/-/binding-linux-ppc64-gnu-1.1.5.tgz",
+      "integrity": "sha512-fsK/sNBnxzBlL4O1JNrZakVQxPspqpED5dLtNsZS9oOKmtSpdNIzxH2kkol5HYTWJN47sE20ztMJPxfZ89qGOg==",
+      "cpu": [
+        "ppc64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-s390x-gnu": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-s390x-gnu/-/binding-linux-s390x-gnu-1.1.5.tgz",
+      "integrity": "sha512-gLYb4BIadlfTOYT5gO503n8zQjXflgzpD0FcyKh0Mzx3rqCZKnHoJWV9xe1KXUJ5lx2JfcSHr/mhzS0PC/McAA==",
+      "cpu": [
+        "s390x"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-x64-gnu": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-x64-gnu/-/binding-linux-x64-gnu-1.1.5.tgz",
+      "integrity": "sha512-FjcpEKUyJygHgs1o50VYNvkt5+7Le/VEdYt0AkRpkL33MnyQfwr8l5mXwMmfmTbyMPr5vJLC+8/Gd9gXnwU1QQ==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-linux-x64-musl": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-linux-x64-musl/-/binding-linux-x64-musl-1.1.5.tgz",
+      "integrity": "sha512-Me+PfPI2TMeOQk0gYWfLQZtTktrmzbr8cDboqX83XKc7UrgAi55gF+2dUkWdxd19n55Essp2yeca+O9N5rBxHg==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-openharmony-arm64": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-openharmony-arm64/-/binding-openharmony-arm64-1.1.5.tgz",
+      "integrity": "sha512-yc5WrLzXks6zCQfn9Oxr8pORKyl/pF+QjHmW/Qx3qu0oyrrNC+y2JLTU1E2rcWYAmzlnqngWXHQjy51VzW70Vw==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "openharmony"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-wasm32-wasi": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-wasm32-wasi/-/binding-wasm32-wasi-1.1.5.tgz",
+      "integrity": "sha512-VbQGPX2b4r48TAMIM2cjgluIM1HYutm4pcTEJsle7iEP7sB1dFqtPLBVbdLAZCxy1txCcPxf4QFf4v8uvltPqA==",
+      "cpu": [
+        "wasm32"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "@emnapi/core": "1.11.1",
+        "@emnapi/runtime": "1.11.1",
+        "@napi-rs/wasm-runtime": "^1.1.6"
+      },
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-wasm32-wasi/node_modules/@emnapi/core": {
+      "version": "1.11.1",
+      "resolved": "https://registry.npmjs.org/@emnapi/core/-/core-1.11.1.tgz",
+      "integrity": "sha512-RSvbQmHzdKzNsLYa/wHrbc3KN4sYLKAdPZxqiM2HATqv/SBk2/ENSHpvXGaLOMcsAyz0poEGqkmmKYG3OWiJEQ==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "@emnapi/wasi-threads": "1.2.2",
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@rolldown/binding-wasm32-wasi/node_modules/@emnapi/runtime": {
+      "version": "1.11.1",
+      "resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.11.1.tgz",
+      "integrity": "sha512-vgj7R3y3Wgx24IQaGPA/R6YFXLHVMOZ0uVEyIQPaWs+rd1AzfEMXlAC22FYwO1XkKR6NPsq7mUandH8oIRdZFw==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@rolldown/binding-wasm32-wasi/node_modules/@emnapi/wasi-threads": {
+      "version": "1.2.2",
+      "resolved": "https://registry.npmjs.org/@emnapi/wasi-threads/-/wasi-threads-1.2.2.tgz",
+      "integrity": "sha512-c95qOXkHdydNKhscBTebqEC1CVAZpyqOfVfBzQ1qgzyl3gfeldUjIggDbIZgDKsHLgnsM+igH7TJ/eAasaVuMA==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@rolldown/binding-win32-arm64-msvc": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-1.1.5.tgz",
+      "integrity": "sha512-gHv82k63z4qpV5+Q1y/12KrK0ltWBukVDI8nZcbT7Tt/ZlOIVwppazneq0F93oDxTo3IgAMEDIoQh3E2n6mVsw==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/binding-win32-x64-msvc": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/@rolldown/binding-win32-x64-msvc/-/binding-win32-x64-msvc-1.1.5.tgz",
+      "integrity": "sha512-tTZuDBPw85tEN5PQi1pnEBzDy0Z49HtScLAbD5t6hyeU92A95pRWaSMw1GZZi/RwgSgUIl0xrSlXIT/9QzvYSA==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      }
+    },
+    "node_modules/@rolldown/pluginutils": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@rolldown/pluginutils/-/pluginutils-1.0.1.tgz",
+      "integrity": "sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==",
+      "dev": true,
+      "license": "MIT"
+    },
+    "node_modules/@tybys/wasm-util": {
+      "version": "0.10.3",
+      "resolved": "https://registry.npmjs.org/@tybys/wasm-util/-/wasm-util-0.10.3.tgz",
+      "integrity": "sha512-F3fo1MYrRJYL3zER0OUOmkutjr1Vp23m7OsSgp7nq4SP6OqX6C/56XFIPAl5bt3zaBRjmW7SGz3u/6LwFpYcOg==",
+      "dev": true,
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@types/node": {
+      "version": "24.13.3",
+      "resolved": "https://registry.npmjs.org/@types/node/-/node-24.13.3.tgz",
+      "integrity": "sha512-Dh8vAsV36ig5wa9OX4pXvMc9D3Veibfw2wix0CUwYODLD8nkj9UsLjASr49nPg+2eKzxhBV+v7L8pXvT4e639Q==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "undici-types": "~7.18.0"
+      }
+    },
+    "node_modules/@types/react": {
+      "version": "19.2.17",
+      "resolved": "https://registry.npmjs.org/@types/react/-/react-19.2.17.tgz",
+      "integrity": "sha512-MXfmqaVPEVgkBT/aY0aGCkRWWtByiYQXo3xdQ8r5RzuFrPiRn8Gar2tQdXSUQ2GKV3bkXckek89V8wQBY2Q/Aw==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "csstype": "^3.2.2"
+      }
+    },
+    "node_modules/@types/react-dom": {
+      "version": "19.2.3",
+      "resolved": "https://registry.npmjs.org/@types/react-dom/-/react-dom-19.2.3.tgz",
+      "integrity": "sha512-jp2L/eY6fn+KgVVQAOqYItbF0VY/YApe5Mz2F0aykSO8gx31bYCZyvSeYxCHKvzHG5eZjc+zyaS5BrBWya2+kQ==",
+      "dev": true,
+      "license": "MIT",
+      "peerDependencies": {
+        "@types/react": "^19.2.0"
+      }
+    },
+    "node_modules/@vitejs/plugin-react": {
+      "version": "6.0.4",
+      "resolved": "https://registry.npmjs.org/@vitejs/plugin-react/-/plugin-react-6.0.4.tgz",
+      "integrity": "sha512-XcCQz0TBpBgljhj0gMuuDj49i6Ytqh5q1osT/Gp5uAVJUCTWxyskk/l1jwYYiu2xcNHHipdMz40EGfM1VdamVg==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "@rolldown/pluginutils": "^1.0.1"
+      },
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      },
+      "peerDependencies": {
+        "@rolldown/plugin-babel": "^0.1.7 || ^0.2.0",
+        "babel-plugin-react-compiler": "^1.0.0",
+        "vite": "^8.0.0"
+      },
+      "peerDependenciesMeta": {
+        "@rolldown/plugin-babel": {
+          "optional": true
+        },
+        "babel-plugin-react-compiler": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/csstype": {
+      "version": "3.2.3",
+      "resolved": "https://registry.npmjs.org/csstype/-/csstype-3.2.3.tgz",
+      "integrity": "sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==",
+      "dev": true,
+      "license": "MIT"
+    },
+    "node_modules/detect-libc": {
+      "version": "2.1.2",
+      "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
+      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==",
+      "dev": true,
+      "license": "Apache-2.0",
+      "engines": {
+        "node": ">=8"
+      }
+    },
+    "node_modules/fdir": {
+      "version": "6.5.0",
+      "resolved": "https://registry.npmjs.org/fdir/-/fdir-6.5.0.tgz",
+      "integrity": "sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=12.0.0"
+      },
+      "peerDependencies": {
+        "picomatch": "^3 || ^4"
+      },
+      "peerDependenciesMeta": {
+        "picomatch": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/fsevents": {
+      "version": "2.3.3",
+      "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
+      "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
+      "dev": true,
+      "hasInstallScript": true,
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
+      }
+    },
+    "node_modules/lightningcss": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss/-/lightningcss-1.33.0.tgz",
+      "integrity": "sha512-WkUDrojuJs0xkgGf2udWxa3yGBRxPtxUkB79i6aCZLRgc7PM8fZe9TosfPDcvEpQZbuFASnHYmRLBLUbmLOIIA==",
+      "dev": true,
+      "license": "MPL-2.0",
+      "dependencies": {
+        "detect-libc": "^2.0.3"
+      },
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      },
+      "optionalDependencies": {
+        "lightningcss-android-arm64": "1.33.0",
+        "lightningcss-darwin-arm64": "1.33.0",
+        "lightningcss-darwin-x64": "1.33.0",
+        "lightningcss-freebsd-x64": "1.33.0",
+        "lightningcss-linux-arm-gnueabihf": "1.33.0",
+        "lightningcss-linux-arm64-gnu": "1.33.0",
+        "lightningcss-linux-arm64-musl": "1.33.0",
+        "lightningcss-linux-x64-gnu": "1.33.0",
+        "lightningcss-linux-x64-musl": "1.33.0",
+        "lightningcss-win32-arm64-msvc": "1.33.0",
+        "lightningcss-win32-x64-msvc": "1.33.0"
+      }
+    },
+    "node_modules/lightningcss-android-arm64": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-android-arm64/-/lightningcss-android-arm64-1.33.0.tgz",
+      "integrity": "sha512-gEpRTalKdosp4Bb8qWtc2iOgE5SeIHlpS1up9bFq2wAyYhl1UdTObYiHe98zEM9SQvSoqQZ1IQD0JNpg3Ml5pg==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "android"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-darwin-arm64": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-darwin-arm64/-/lightningcss-darwin-arm64-1.33.0.tgz",
+      "integrity": "sha512-Sciaz8eenNTKn9b3t7+xr0ipTp9YxKQY4npwQ3mrRuL0BAVHBLyZxofhaKBAVtzmtRZ/zTyo0/to4B1uWG/Djg==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-darwin-x64": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-darwin-x64/-/lightningcss-darwin-x64-1.33.0.tgz",
+      "integrity": "sha512-Z5UPAxzrjlWNNyGy6i65cJzzvgJ5D3T6wMvs+gWpY9d7qRhANrxqAp6LhxIgZhWEw18RfJTGcRxjuLIBr+m8XQ==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-freebsd-x64": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-freebsd-x64/-/lightningcss-freebsd-x64-1.33.0.tgz",
+      "integrity": "sha512-QQM/Ti/hQajJwCY+RiWuCZ9sdtI/XQk7nDK5vC8kkdwixezOlDgvDx7+RT+QjK6FcFT4MpsuoBnHIo/O3StRRg==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "freebsd"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-linux-arm-gnueabihf": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm-gnueabihf/-/lightningcss-linux-arm-gnueabihf-1.33.0.tgz",
+      "integrity": "sha512-N7FVBe6iS24MlM6R/4RBTxGhQheZGs7tiQ9U32UtF75NzP5Q7xWPRqLBCKxlRQRk3rY1jCIPLzx7WzOhuUIRLQ==",
+      "cpu": [
+        "arm"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-linux-arm64-gnu": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm64-gnu/-/lightningcss-linux-arm64-gnu-1.33.0.tgz",
+      "integrity": "sha512-j2v/itmy4HlNxlc6voKXYgBqNi0Ng2LShg4z7GufpEgs05P+2suBVyi9I6YHq5uoVFx9ETin3eCEhLVyXGQnKg==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-linux-arm64-musl": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-linux-arm64-musl/-/lightningcss-linux-arm64-musl-1.33.0.tgz",
+      "integrity": "sha512-yiO5ROMuYQgXbC60yjZU5CYSFZGKXL0HFATXt9mHJn1+zW55oCtMI9NfcVhYLMFDL7gV7oBPon/EmMMGg2OvtQ==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-linux-x64-gnu": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-linux-x64-gnu/-/lightningcss-linux-x64-gnu-1.33.0.tgz",
+      "integrity": "sha512-ar+Ju7LmcN0Jo4FpL4hpFybwNG9/3A/Br5KW2n2jyODg3MEZXaDYADdemoNS+BDNfMgKvylJLj4S5tyRActuAg==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-linux-x64-musl": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-linux-x64-musl/-/lightningcss-linux-x64-musl-1.33.0.tgz",
+      "integrity": "sha512-RYiYbkokw0trfKqqzfF55lginwEPrD3OJDfTuJzFs1MK6iFnDenaz1fqLLtX4ITG3OktJQXOeTaw1awrBAlZPw==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-win32-arm64-msvc": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-win32-arm64-msvc/-/lightningcss-win32-arm64-msvc-1.33.0.tgz",
+      "integrity": "sha512-1K+MPfLSFVpphzpdbfkhlWk6wBrTObBzS2T6db10PNOZgR9GoVsAWzwNyuhUYYbTp23j+4RrncfujZ4uAzXvwA==",
+      "cpu": [
+        "arm64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/lightningcss-win32-x64-msvc": {
+      "version": "1.33.0",
+      "resolved": "https://registry.npmjs.org/lightningcss-win32-x64-msvc/-/lightningcss-win32-x64-msvc-1.33.0.tgz",
+      "integrity": "sha512-OlEICDx/Xl0FqSp4bry8zFnCvGpig3Gl4gCquvYwHuqJKEC1+n9NgDniFvqHGmMv1ZkqDJrDqKKSykTDX+ehuA==",
+      "cpu": [
+        "x64"
+      ],
+      "dev": true,
+      "license": "MPL-2.0",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "funding": {
+        "type": "opencollective",
+        "url": "https://opencollective.com/parcel"
+      }
+    },
+    "node_modules/nanoid": {
+      "version": "3.3.16",
+      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.16.tgz",
+      "integrity": "sha512-bzlKTyNJ7+LdGIIwy8ijFpIqEQIvafahV7eYykJ8Cvh42EdJeODoJ6gUJXpQJvej1BddH8OqTXZNE/KfbWAu8Q==",
+      "dev": true,
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/ai"
+        }
+      ],
+      "license": "MIT",
+      "bin": {
+        "nanoid": "bin/nanoid.cjs"
+      },
+      "engines": {
+        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
+      }
+    },
+    "node_modules/oxlint": {
+      "version": "1.76.0",
+      "resolved": "https://registry.npmjs.org/oxlint/-/oxlint-1.76.0.tgz",
+      "integrity": "sha512-6QoFioEU4fNdiUx/2Eo6TRd6NG7H7njnRCz8rhB66cZmMHDTqcm1Rjvl8Wry+ZTQMBAmyb4Mlf62Mk5X+eHSOw==",
+      "dev": true,
+      "license": "MIT",
+      "bin": {
+        "oxlint": "bin/oxlint"
+      },
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/Boshen"
+      },
+      "optionalDependencies": {
+        "@oxlint/binding-android-arm-eabi": "1.76.0",
+        "@oxlint/binding-android-arm64": "1.76.0",
+        "@oxlint/binding-darwin-arm64": "1.76.0",
+        "@oxlint/binding-darwin-x64": "1.76.0",
+        "@oxlint/binding-freebsd-x64": "1.76.0",
+        "@oxlint/binding-linux-arm-gnueabihf": "1.76.0",
+        "@oxlint/binding-linux-arm-musleabihf": "1.76.0",
+        "@oxlint/binding-linux-arm64-gnu": "1.76.0",
+        "@oxlint/binding-linux-arm64-musl": "1.76.0",
+        "@oxlint/binding-linux-ppc64-gnu": "1.76.0",
+        "@oxlint/binding-linux-riscv64-gnu": "1.76.0",
+        "@oxlint/binding-linux-riscv64-musl": "1.76.0",
+        "@oxlint/binding-linux-s390x-gnu": "1.76.0",
+        "@oxlint/binding-linux-x64-gnu": "1.76.0",
+        "@oxlint/binding-linux-x64-musl": "1.76.0",
+        "@oxlint/binding-openharmony-arm64": "1.76.0",
+        "@oxlint/binding-win32-arm64-msvc": "1.76.0",
+        "@oxlint/binding-win32-ia32-msvc": "1.76.0",
+        "@oxlint/binding-win32-x64-msvc": "1.76.0"
+      },
+      "peerDependencies": {
+        "oxlint-tsgolint": ">=7.0.2001",
+        "vite-plus": "*"
+      },
+      "peerDependenciesMeta": {
+        "oxlint-tsgolint": {
+          "optional": true
+        },
+        "vite-plus": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/picocolors": {
+      "version": "1.1.1",
+      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
+      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
+      "dev": true,
+      "license": "ISC"
+    },
+    "node_modules/picomatch": {
+      "version": "4.0.5",
+      "resolved": "https://registry.npmjs.org/picomatch/-/picomatch-4.0.5.tgz",
+      "integrity": "sha512-RvwwcruNjI1ncT5xRakeyS9Lf8lcItv34KD+aif+VH9kduAyfYBipGh12274xtenIPZ119/R9BdTBa8gAwSh0A==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">=12"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/jonschlinkert"
+      }
+    },
+    "node_modules/postcss": {
+      "version": "8.5.24",
+      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.24.tgz",
+      "integrity": "sha512-8RyVklq0owXUTa4xlpzu4l9AaVKIdQvAcOHZWaMh98HgySsUtxRVf/chRe3dsSLqb6i40BzGRzEUddRaI+9TSw==",
+      "dev": true,
+      "funding": [
+        {
+          "type": "opencollective",
+          "url": "https://opencollective.com/postcss/"
+        },
+        {
+          "type": "tidelift",
+          "url": "https://tidelift.com/funding/github/npm/postcss"
+        },
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/ai"
+        }
+      ],
+      "license": "MIT",
+      "dependencies": {
+        "nanoid": "^3.3.16",
+        "picocolors": "^1.1.1",
+        "source-map-js": "^1.2.1"
+      },
+      "engines": {
+        "node": "^10 || ^12 || >=14"
+      }
+    },
+    "node_modules/react": {
+      "version": "19.2.8",
+      "resolved": "https://registry.npmjs.org/react/-/react-19.2.8.tgz",
+      "integrity": "sha512-PWaYA1L/q9u2u7xYQi+Y3L3Yfnie7XyLeaJICV1MGD6LprsBxcAqGjYyr0eY3p+QdsA+x/Irkt4Qif8D63+Sbw==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=0.10.0"
+      }
+    },
+    "node_modules/react-dom": {
+      "version": "19.2.8",
+      "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.2.8.tgz",
+      "integrity": "sha512-rVprimfGBG3DR+Tq0IQG2DT5PxKth1WIGDmj5yPmlzr4YBe7uyE+Du4oVqTDXZSHGGGXRtTJEGSSePyQCMBglQ==",
+      "license": "MIT",
+      "dependencies": {
+        "scheduler": "^0.27.0"
+      },
+      "peerDependencies": {
+        "react": "^19.2.8"
+      }
+    },
+    "node_modules/rolldown": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/rolldown/-/rolldown-1.1.5.tgz",
+      "integrity": "sha512-t9z29cJjXf/vxQ8dyhCSpt6H6aSwHTk8cT5I3iy6SMXuFpk5mB6PL6XfC8PCwrPTx93udwKUm9HRteAlTGBLiA==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "@oxc-project/types": "=0.139.0",
+        "@rolldown/pluginutils": "^1.0.0"
+      },
+      "bin": {
+        "rolldown": "bin/cli.mjs"
+      },
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      },
+      "optionalDependencies": {
+        "@rolldown/binding-android-arm64": "1.1.5",
+        "@rolldown/binding-darwin-arm64": "1.1.5",
+        "@rolldown/binding-darwin-x64": "1.1.5",
+        "@rolldown/binding-freebsd-x64": "1.1.5",
+        "@rolldown/binding-linux-arm-gnueabihf": "1.1.5",
+        "@rolldown/binding-linux-arm64-gnu": "1.1.5",
+        "@rolldown/binding-linux-arm64-musl": "1.1.5",
+        "@rolldown/binding-linux-ppc64-gnu": "1.1.5",
+        "@rolldown/binding-linux-s390x-gnu": "1.1.5",
+        "@rolldown/binding-linux-x64-gnu": "1.1.5",
+        "@rolldown/binding-linux-x64-musl": "1.1.5",
+        "@rolldown/binding-openharmony-arm64": "1.1.5",
+        "@rolldown/binding-wasm32-wasi": "1.1.5",
+        "@rolldown/binding-win32-arm64-msvc": "1.1.5",
+        "@rolldown/binding-win32-x64-msvc": "1.1.5"
+      }
+    },
+    "node_modules/scheduler": {
+      "version": "0.27.0",
+      "resolved": "https://registry.npmjs.org/scheduler/-/scheduler-0.27.0.tgz",
+      "integrity": "sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q==",
+      "license": "MIT"
+    },
+    "node_modules/source-map-js": {
+      "version": "1.2.1",
+      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.1.tgz",
+      "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==",
+      "dev": true,
+      "license": "BSD-3-Clause",
+      "engines": {
+        "node": ">=0.10.0"
+      }
+    },
+    "node_modules/tinyglobby": {
+      "version": "0.2.17",
+      "resolved": "https://registry.npmjs.org/tinyglobby/-/tinyglobby-0.2.17.tgz",
+      "integrity": "sha512-wXR/dYpcqKmfWpEdZjiKJOwCNFndD0DMnrW/cYjVGttEkBfVgcLFHoNrlj47mjOVic9yyNu65alsgF4NQyTa2g==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "fdir": "^6.5.0",
+        "picomatch": "^4.0.4"
+      },
+      "engines": {
+        "node": ">=12.0.0"
+      },
+      "funding": {
+        "url": "https://github.com/sponsors/SuperchupuDev"
+      }
+    },
+    "node_modules/tslib": {
+      "version": "2.8.1",
+      "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.8.1.tgz",
+      "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==",
+      "dev": true,
+      "license": "0BSD",
+      "optional": true
+    },
+    "node_modules/typescript": {
+      "version": "6.0.3",
+      "resolved": "https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz",
+      "integrity": "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==",
+      "dev": true,
+      "license": "Apache-2.0",
+      "bin": {
+        "tsc": "bin/tsc",
+        "tsserver": "bin/tsserver"
+      },
+      "engines": {
+        "node": ">=14.17"
+      }
+    },
+    "node_modules/undici-types": {
+      "version": "7.18.2",
+      "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-7.18.2.tgz",
+      "integrity": "sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w==",
+      "dev": true,
+      "license": "MIT"
+    },
+    "node_modules/vite": {
+      "version": "8.1.5",
+      "resolved": "https://registry.npmjs.org/vite/-/vite-8.1.5.tgz",
+      "integrity": "sha512-7ULLwsCdYx/nRyrpiEwvqb5TFHrMVZyBt+rg/OAXT7rgj/z+DtTDyKFeLAdDkubDVDKD8jOsndmy7m55XcfUsw==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "lightningcss": "^1.32.0",
+        "picomatch": "^4.0.5",
+        "postcss": "^8.5.17",
+        "rolldown": "~1.1.5",
+        "tinyglobby": "^0.2.17"
+      },
+      "bin": {
+        "vite": "bin/vite.js"
+      },
+      "engines": {
+        "node": "^20.19.0 || >=22.12.0"
+      },
+      "funding": {
+        "url": "https://github.com/vitejs/vite?sponsor=1"
+      },
+      "optionalDependencies": {
+        "fsevents": "~2.3.3"
+      },
+      "peerDependencies": {
+        "@types/node": "^20.19.0 || >=22.12.0",
+        "@vitejs/devtools": "^0.3.0",
+        "esbuild": "^0.27.0 || ^0.28.0",
+        "jiti": ">=1.21.0",
+        "less": "^4.0.0",
+        "sass": "^1.70.0",
+        "sass-embedded": "^1.70.0",
+        "stylus": ">=0.54.8",
+        "sugarss": "^5.0.0",
+        "terser": "^5.16.0",
+        "tsx": "^4.8.1",
+        "yaml": "^2.4.2"
+      },
+      "peerDependenciesMeta": {
+        "@types/node": {
+          "optional": true
+        },
+        "@vitejs/devtools": {
+          "optional": true
+        },
+        "esbuild": {
+          "optional": true
+        },
+        "jiti": {
+          "optional": true
+        },
+        "less": {
+          "optional": true
+        },
+        "sass": {
+          "optional": true
+        },
+        "sass-embedded": {
+          "optional": true
+        },
+        "stylus": {
+          "optional": true
+        },
+        "sugarss": {
+          "optional": true
+        },
+        "terser": {
+          "optional": true
+        },
+        "tsx": {
+          "optional": true
+        },
+        "yaml": {
+          "optional": true
+        }
+      }
+    }
+  }
+}
+
+
+==================================================
+FILE: frontend/tsconfig.app.json
+==================================================
+
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    "module": "esnext",
+    "types": ["vite/client"],
+    "allowArbitraryExtensions": true,
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src"]
+}
+
+
+==================================================
+FILE: frontend/README.md
+==================================================
+
+# React + TypeScript + Vite
+
+This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+
+Currently, two official plugins are available:
+
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+
+## React Compiler
+
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+
+## Expanding the Oxlint configuration
+
+If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+
+```json
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "oxc"],
+  "options": {
+    "typeAware": true
+  },
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/only-export-components": ["warn", { "allowConstantExport": true }]
+  }
+}
+```
+
+See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+
+
+==================================================
+FILE: frontend/tsconfig.json
+==================================================
+
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}
+
+
+==================================================
+FILE: frontend/public/favicon.svg
+==================================================
+
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="46" fill="none" viewBox="0 0 48 46"><path fill="#863bff" d="M25.946 44.938c-.664.845-2.021.375-2.021-.698V33.937a2.26 2.26 0 0 0-2.262-2.262H10.287c-.92 0-1.456-1.04-.92-1.788l7.48-10.471c1.07-1.497 0-3.578-1.842-3.578H1.237c-.92 0-1.456-1.04-.92-1.788L10.013.474c.214-.297.556-.474.92-.474h28.894c.92 0 1.456 1.04.92 1.788l-7.48 10.471c-1.07 1.498 0 3.579 1.842 3.579h11.377c.943 0 1.473 1.088.89 1.83L25.947 44.94z" style="fill:#863bff;fill:color(display-p3 .5252 .23 1);fill-opacity:1"/><mask id="a" width="48" height="46" x="0" y="0" maskUnits="userSpaceOnUse" style="mask-type:alpha"><path fill="#000" d="M25.842 44.938c-.664.844-2.021.375-2.021-.698V33.937a2.26 2.26 0 0 0-2.262-2.262H10.183c-.92 0-1.456-1.04-.92-1.788l7.48-10.471c1.07-1.498 0-3.579-1.842-3.579H1.133c-.92 0-1.456-1.04-.92-1.787L9.91.473c.214-.297.556-.474.92-.474h28.894c.92 0 1.456 1.04.92 1.788l-7.48 10.471c-1.07 1.498 0 3.578 1.842 3.578h11.377c.943 0 1.473 1.088.89 1.832L25.843 44.94z" style="fill:#000;fill-opacity:1"/></mask><g mask="url(#a)"><g filter="url(#b)"><ellipse cx="5.508" cy="14.704" fill="#ede6ff" rx="5.508" ry="14.704" style="fill:#ede6ff;fill:color(display-p3 .9275 .9033 1);fill-opacity:1" transform="matrix(.00324 1 1 -.00324 -4.47 31.516)"/></g><g filter="url(#c)"><ellipse cx="10.399" cy="29.851" fill="#ede6ff" rx="10.399" ry="29.851" style="fill:#ede6ff;fill:color(display-p3 .9275 .9033 1);fill-opacity:1" transform="matrix(.00324 1 1 -.00324 -39.328 7.883)"/></g><g filter="url(#d)"><ellipse cx="5.508" cy="30.487" fill="#7e14ff" rx="5.508" ry="30.487" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.814 -25.913 -14.639)scale(1 -1)"/></g><g filter="url(#e)"><ellipse cx="5.508" cy="30.599" fill="#7e14ff" rx="5.508" ry="30.599" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.814 -32.644 -3.334)scale(1 -1)"/></g><g filter="url(#f)"><ellipse cx="5.508" cy="30.599" fill="#7e14ff" rx="5.508" ry="30.599" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="matrix(.00324 1 1 -.00324 -34.34 30.47)"/></g><g filter="url(#g)"><ellipse cx="14.072" cy="22.078" fill="#ede6ff" rx="14.072" ry="22.078" style="fill:#ede6ff;fill:color(display-p3 .9275 .9033 1);fill-opacity:1" transform="rotate(93.35 24.506 48.493)scale(-1 1)"/></g><g filter="url(#h)"><ellipse cx="3.47" cy="21.501" fill="#7e14ff" rx="3.47" ry="21.501" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.009 28.708 47.59)scale(-1 1)"/></g><g filter="url(#i)"><ellipse cx="3.47" cy="21.501" fill="#7e14ff" rx="3.47" ry="21.501" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.009 28.708 47.59)scale(-1 1)"/></g><g filter="url(#j)"><ellipse cx=".387" cy="8.972" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(39.51 .387 8.972)"/></g><g filter="url(#k)"><ellipse cx="47.523" cy="-6.092" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 47.523 -6.092)"/></g><g filter="url(#l)"><ellipse cx="41.412" cy="6.333" fill="#47bfff" rx="5.971" ry="9.665" style="fill:#47bfff;fill:color(display-p3 .2799 .748 1);fill-opacity:1" transform="rotate(37.892 41.412 6.333)"/></g><g filter="url(#m)"><ellipse cx="-1.879" cy="38.332" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 -1.88 38.332)"/></g><g filter="url(#n)"><ellipse cx="-1.879" cy="38.332" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 -1.88 38.332)"/></g><g filter="url(#o)"><ellipse cx="35.651" cy="29.907" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 35.651 29.907)"/></g><g filter="url(#p)"><ellipse cx="38.418" cy="32.4" fill="#47bfff" rx="5.971" ry="15.297" style="fill:#47bfff;fill:color(display-p3 .2799 .748 1);fill-opacity:1" transform="rotate(37.892 38.418 32.4)"/></g></g><defs><filter id="b" width="60.045" height="41.654" x="-19.77" y="16.149" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="7.659"/></filter><filter id="c" width="90.34" height="51.437" x="-54.613" y="-7.533" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="7.659"/></filter><filter id="d" width="79.355" height="29.4" x="-49.64" y="2.03" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="e" width="79.579" height="29.4" x="-45.045" y="20.029" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="f" width="79.579" height="29.4" x="-43.513" y="21.178" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="g" width="74.749" height="58.852" x="15.756" y="-17.901" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="7.659"/></filter><filter id="h" width="61.377" height="25.362" x="23.548" y="2.284" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="i" width="61.377" height="25.362" x="23.548" y="2.284" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="j" width="56.045" height="63.649" x="-27.636" y="-22.853" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="k" width="54.814" height="64.646" x="20.116" y="-38.415" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="l" width="33.541" height="35.313" x="24.641" y="-11.323" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="m" width="54.814" height="64.646" x="-29.286" y="6.009" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="n" width="54.814" height="64.646" x="-29.286" y="6.009" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="o" width="54.814" height="64.646" x="8.244" y="-2.416" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="p" width="39.409" height="43.623" x="18.713" y="10.588" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter></defs></svg>
+
+==================================================
+FILE: frontend/public/icons.svg
+==================================================
+
+<svg xmlns="http://www.w3.org/2000/svg">
+  <symbol id="bluesky-icon" viewBox="0 0 16 17">
+    <g clip-path="url(#bluesky-clip)"><path fill="#08060d" d="M7.75 7.735c-.693-1.348-2.58-3.86-4.334-5.097-1.68-1.187-2.32-.981-2.74-.79C.188 2.065.1 2.812.1 3.251s.241 3.602.398 4.13c.52 1.744 2.367 2.333 4.07 2.145-2.495.37-4.71 1.278-1.805 4.512 3.196 3.309 4.38-.71 4.987-2.746.608 2.036 1.307 5.91 4.93 2.746 2.72-2.746.747-4.143-1.747-4.512 1.702.189 3.55-.4 4.07-2.145.156-.528.397-3.691.397-4.13s-.088-1.186-.575-1.406c-.42-.19-1.06-.395-2.741.79-1.755 1.24-3.64 3.752-4.334 5.099"/></g>
+    <defs><clipPath id="bluesky-clip"><path fill="#fff" d="M.1.85h15.3v15.3H.1z"/></clipPath></defs>
+  </symbol>
+  <symbol id="discord-icon" viewBox="0 0 20 19">
+    <path fill="#08060d" d="M16.224 3.768a14.5 14.5 0 0 0-3.67-1.153c-.158.286-.343.67-.47.976a13.5 13.5 0 0 0-4.067 0c-.128-.306-.317-.69-.476-.976A14.4 14.4 0 0 0 3.868 3.77C1.546 7.28.916 10.703 1.231 14.077a14.7 14.7 0 0 0 4.5 2.306q.545-.748.965-1.587a9.5 9.5 0 0 1-1.518-.74q.191-.14.372-.293c2.927 1.369 6.107 1.369 8.999 0q.183.152.372.294-.723.437-1.52.74.418.838.963 1.588a14.6 14.6 0 0 0 4.504-2.308c.37-3.911-.63-7.302-2.644-10.309m-9.13 8.234c-.878 0-1.599-.82-1.599-1.82 0-.998.705-1.82 1.6-1.82.894 0 1.614.82 1.599 1.82.001 1-.705 1.82-1.6 1.82m5.91 0c-.878 0-1.599-.82-1.599-1.82 0-.998.705-1.82 1.6-1.82.893 0 1.614.82 1.599 1.82 0 1-.706 1.82-1.6 1.82"/>
+  </symbol>
+  <symbol id="documentation-icon" viewBox="0 0 21 20">
+    <path fill="none" stroke="#aa3bff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35" d="m15.5 13.333 1.533 1.322c.645.555.967.833.967 1.178s-.322.623-.967 1.179L15.5 18.333m-3.333-5-1.534 1.322c-.644.555-.966.833-.966 1.178s.322.623.966 1.179l1.534 1.321"/>
+    <path fill="none" stroke="#aa3bff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35" d="M17.167 10.836v-4.32c0-1.41 0-2.117-.224-2.68-.359-.906-1.118-1.621-2.08-1.96-.599-.21-1.349-.21-2.848-.21-2.623 0-3.935 0-4.983.369-1.684.591-3.013 1.842-3.641 3.428C3 6.449 3 7.684 3 10.154v2.122c0 2.558 0 3.838.706 4.726q.306.383.713.671c.76.536 1.79.64 3.581.66"/>
+    <path fill="none" stroke="#aa3bff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35" d="M3 10a2.78 2.78 0 0 1 2.778-2.778c.555 0 1.209.097 1.748-.047.48-.129.854-.503.982-.982.145-.54.048-1.194.048-1.749a2.78 2.78 0 0 1 2.777-2.777"/>
+  </symbol>
+  <symbol id="github-icon" viewBox="0 0 19 19">
+    <path fill="#08060d" fill-rule="evenodd" d="M9.356 1.85C5.05 1.85 1.57 5.356 1.57 9.694a7.84 7.84 0 0 0 5.324 7.44c.387.079.528-.168.528-.376 0-.182-.013-.805-.013-1.454-2.165.467-2.616-.935-2.616-.935-.349-.91-.864-1.143-.864-1.143-.71-.48.051-.48.051-.48.787.051 1.2.805 1.2.805.695 1.194 1.817.857 2.268.649.064-.507.27-.857.49-1.052-1.728-.182-3.545-.857-3.545-3.87 0-.857.31-1.558.8-2.104-.078-.195-.349-1 .077-2.078 0 0 .657-.208 2.14.805a7.5 7.5 0 0 1 1.946-.26c.657 0 1.328.092 1.946.26 1.483-1.013 2.14-.805 2.14-.805.426 1.078.155 1.883.078 2.078.502.546.799 1.247.799 2.104 0 3.013-1.818 3.675-3.558 3.87.284.247.528.714.528 1.454 0 1.052-.012 1.896-.012 2.156 0 .208.142.455.528.377a7.84 7.84 0 0 0 5.324-7.441c.013-4.338-3.48-7.844-7.773-7.844" clip-rule="evenodd"/>
+  </symbol>
+  <symbol id="social-icon" viewBox="0 0 20 20">
+    <path fill="none" stroke="#aa3bff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35" d="M12.5 6.667a4.167 4.167 0 1 0-8.334 0 4.167 4.167 0 0 0 8.334 0"/>
+    <path fill="none" stroke="#aa3bff" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.35" d="M2.5 16.667a5.833 5.833 0 0 1 8.75-5.053m3.837.474.513 1.035c.07.144.257.282.414.309l.93.155c.596.1.736.536.307.965l-.723.73a.64.64 0 0 0-.152.531l.207.903c.164.715-.213.991-.84.618l-.872-.52a.63.63 0 0 0-.577 0l-.872.52c-.624.373-1.003.094-.84-.618l.207-.903a.64.64 0 0 0-.152-.532l-.723-.729c-.426-.43-.289-.864.306-.964l.93-.156a.64.64 0 0 0 .412-.31l.513-1.034c.28-.562.735-.562 1.012 0"/>
+  </symbol>
+  <symbol id="x-icon" viewBox="0 0 19 19">
+    <path fill="#08060d" fill-rule="evenodd" d="M1.893 1.98c.052.072 1.245 1.769 2.653 3.77l2.892 4.114c.183.261.333.48.333.486s-.068.089-.152.183l-.522.593-.765.867-3.597 4.087c-.375.426-.734.834-.798.905a1 1 0 0 0-.118.148c0 .01.236.017.664.017h.663l.729-.83c.4-.457.796-.906.879-.999a692 692 0 0 0 1.794-2.038c.034-.037.301-.34.594-.675l.551-.624.345-.392a7 7 0 0 1 .34-.374c.006 0 .93 1.306 2.052 2.903l2.084 2.965.045.063h2.275c1.87 0 2.273-.003 2.266-.021-.008-.02-1.098-1.572-3.894-5.547-2.013-2.862-2.28-3.246-2.273-3.266.008-.019.282-.332 2.085-2.38l2-2.274 1.567-1.782c.022-.028-.016-.03-.65-.03h-.674l-.3.342a871 871 0 0 1-1.782 2.025c-.067.075-.405.458-.75.852a100 100 0 0 1-.803.91c-.148.172-.299.344-.99 1.127-.304.343-.32.358-.345.327-.015-.019-.904-1.282-1.976-2.808L6.365 1.85H1.8zm1.782.91 8.078 11.294c.772 1.08 1.413 1.973 1.425 1.984.016.017.241.02 1.05.017l1.03-.004-2.694-3.766L7.796 5.75 5.722 2.852l-1.039-.004-1.039-.004z" clip-rule="evenodd"/>
+  </symbol>
+</svg>
+
+
+==================================================
+FILE: frontend/src/index.css
+==================================================
+
+* { margin: 0; padding: 0; }
+body { min-height: 100vh; }
+
+
+==================================================
+FILE: frontend/src/App.tsx
+==================================================
+
+import { useEffect, useState, useCallback } from "react";
+import "./App.css";
+
+const API_BASE = import.meta.env.VITE_TREASURY_AGENT_URL || "http://localhost:4001";
+const EXPLORER_TX = "https://testnet.arcscan.app/tx/";
+
+interface FlowEvent {
+  id: string;
+  milestoneId: string;
+  contractorAddress: string;
+  amount: number;
+  stage: "received" | "risk_checked" | "settled" | "held" | "failed";
+  detail: string;
+  timestamp: string;
+}
+
+interface AgentInfo {
+  name: string;
+  role: string;
+  address: string | null;
+  registrationTx: string;
+}
+
+interface TreasuryHealth {
+  treasuryBalance: number;
+  projectState: {
+    projectBudgetTotal: number;
+    projectBudgetRemaining: number;
+    settlements: Array<{ milestoneId: string; amount: number; txHash: string; settledAt: string }>;
+  };
+}
+
+const STAGE_LABEL: Record<FlowEvent["stage"], string> = {
+  received: "VERIFIED",
+  risk_checked: "RISK CHECK",
+  settled: "SETTLED",
+  held: "HELD",
+  failed: "FAILED",
+};
+
+function shortAddr(a: string | null) {
+  if (!a) return "—";
+  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+}
+
+function timeAgo(iso: string) {
+  const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return `${Math.floor(s / 3600)}h ago`;
+}
+
+function App() {
+  const [health, setHealth] = useState<TreasuryHealth | null>(null);
+  const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const [events, setEvents] = useState<FlowEvent[]>([]);
+  const [connected, setConnected] = useState(false);
+
+  const poll = useCallback(async () => {
+    try {
+      const [h, a, ev] = await Promise.all([
+        fetch(`${API_BASE}/health`).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`/health ${r.status}`)))),
+        fetch(`${API_BASE}/agents`).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`/agents ${r.status}`)))),
+        fetch(`${API_BASE}/activity`).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`/activity ${r.status}`)))),
+      ]);
+      setHealth(h);
+      setAgents(a.agents);
+      setEvents(ev.events);
+      setConnected(true);
+    } catch (err) {
+      console.warn("[buildfi] poll failed:", err);
+      setConnected(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    poll();
+    const t = setInterval(poll, 3000);
+    return () => clearInterval(t);
+  }, [poll]);
+
+  const budgetPct = health?.projectState
+    ? Math.round((health.projectState.projectBudgetRemaining / health.projectState.projectBudgetTotal) * 100)
+    : 0;
+
+  return (
+    <div className="page">
+      <header className="topbar">
+        <div className="wordmark">
+          Build<span className="accent">Fi</span>
+        </div>
+        <div className={`status-pill ${connected ? "live" : "offline"}`}>
+          <span className="dot" />
+          {connected ? "Treasury Agent live" : "Connecting…"}
+        </div>
+      </header>
+
+      <p className="subhead">Autonomous agent-to-agent USDC settlement on Arc</p>
+
+      <div className="grid">
+        <section className="panel treasury">
+          <div className="panel-label">Treasury</div>
+          <div className="big-number">
+            {health ? health.treasuryBalance.toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"}
+            <span className="unit">USDC</span>
+          </div>
+          <div className="meter">
+            <div className="meter-fill" style={{ width: `${budgetPct}%` }} />
+          </div>
+          <div className="meter-caption">
+            <span>{health ? health.projectState.projectBudgetRemaining.toLocaleString() : "—"} budget remaining</span>
+            <span>{budgetPct}%</span>
+          </div>
+        </section>
+
+        <section className="panel agents">
+          <div className="panel-label">Registered agents</div>
+          {agents.map((a) => (
+            <div className="agent-row" key={a.role}>
+              <div className={`agent-dot ${a.role}`} />
+              <div className="agent-meta">
+                <div className="agent-name">{a.name}</div>
+                <div className="agent-addr mono">{shortAddr(a.address)}</div>
+              </div>
+              <a className="agent-link" href={`${EXPLORER_TX}${a.registrationTx}`} target="_blank" rel="noreferrer">
+                identity tx ↗
+              </a>
+            </div>
+          ))}
+          {agents.length === 0 && <div className="empty-hint">Waiting for Treasury Agent…</div>}
+        </section>
+
+        <section className="panel ledger">
+          <div className="panel-label">Live flow</div>
+          {events.length === 0 && (
+            <div className="empty-hint">No milestones processed yet. Submit one to see the flow live.</div>
+          )}
+          <div className="ledger-list">
+            {events.map((e) => (
+              <div className={`ledger-row stage-${e.stage}`} key={e.id}>
+                <div className="ledger-tag mono">[{STAGE_LABEL[e.stage]}]</div>
+                <div className="ledger-body">
+                  <div className="ledger-detail">{e.detail}</div>
+                  <div className="ledger-sub mono">
+                    milestone {e.milestoneId.slice(0, 10)}… · {shortAddr(e.contractorAddress)} · {e.amount} USDC
+                    {e.stage === "settled" && e.detail.startsWith("0x") && (
+                      <>
+                        {" · "}
+                        <a href={`${EXPLORER_TX}${e.detail}`} target="_blank" rel="noreferrer">
+                          view tx ↗
+                        </a>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <div className="ledger-time mono">{timeAgo(e.timestamp)}</div>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+
+      <footer className="foot">
+        Inspector Agent verifies → Treasury Agent risk-checks → USDC settles on Arc Testnet — autonomously.
+      </footer>
+    </div>
+  );
+}
+
+export default App;
+
+
+==================================================
+FILE: frontend/src/App.css
+==================================================
+
+:root {
+  --ink: #0b1220;
+  --paper: #ffffff;
+  --mute: #5b6472;
+  --green: #16c784;
+  --amber: #e8a33d;
+  --red: #e6604f;
+  --card: #f4f6f8;
+  --line: #e2e6ea;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  --sans: -apple-system, "Segoe UI", Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ink);
+  font-family: var(--sans);
+  color: var(--paper);
+}
+
+.page {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 4rem;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.wordmark {
+  font-size: 1.4rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+.wordmark .accent { color: var(--green); }
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.8rem;
+  color: #afc0d6;
+  border: 1px solid #24304a;
+  border-radius: 999px;
+  padding: 0.35rem 0.8rem;
+}
+.status-pill .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--mute);
+}
+.status-pill.live .dot {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(22, 199, 132, 0.2);
+}
+
+.subhead {
+  color: #8b9ab3;
+  margin: 0.6rem 0 2rem;
+  font-size: 0.95rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-areas:
+    "treasury agents"
+    "ledger ledger";
+  gap: 1rem;
+}
+.panel.treasury { grid-area: treasury; }
+.panel.agents { grid-area: agents; }
+.panel.ledger { grid-area: ledger; }
+
+.panel {
+  background: #101a2e;
+  border: 1px solid #1c2740;
+  border-radius: 14px;
+  padding: 1.4rem 1.5rem;
+}
+
+.panel-label {
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #7686a3;
+  margin-bottom: 0.9rem;
+}
+
+.big-number {
+  font-family: var(--mono);
+  font-size: 2.6rem;
+  font-weight: 600;
+  line-height: 1;
+}
+.big-number .unit {
+  font-family: var(--sans);
+  font-size: 0.95rem;
+  color: #7686a3;
+  margin-left: 0.5rem;
+  font-weight: 400;
+}
+
+.meter {
+  height: 6px;
+  background: #1c2740;
+  border-radius: 4px;
+  margin-top: 1.1rem;
+  overflow: hidden;
+}
+.meter-fill {
+  height: 100%;
+  background: var(--green);
+  border-radius: 4px;
+  transition: width 0.4s ease;
+}
+.meter-caption {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.78rem;
+  color: #7686a3;
+  margin-top: 0.5rem;
+}
+
+.agent-row {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.55rem 0;
+  border-top: 1px solid #1c2740;
+}
+.agent-row:first-of-type { border-top: none; }
+
+.agent-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.agent-dot.inspector { background: var(--amber); }
+.agent-dot.treasury { background: var(--green); }
+
+.agent-meta { flex: 1; min-width: 0; }
+.agent-name { font-size: 0.9rem; font-weight: 600; }
+.agent-addr { font-size: 0.76rem; color: #7686a3; }
+
+.agent-link {
+  font-size: 0.76rem;
+  color: var(--green);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.agent-link:hover { text-decoration: underline; }
+
+.empty-hint {
+  color: #566a8c;
+  font-size: 0.85rem;
+  padding: 0.6rem 0;
+}
+
+.ledger-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.ledger-row {
+  display: grid;
+  grid-template-columns: 110px 1fr auto;
+  align-items: start;
+  gap: 0.9rem;
+  padding: 0.65rem 0.8rem;
+  border-left: 3px solid var(--mute);
+  background: #0c1526;
+  border-radius: 6px;
+}
+.ledger-row.stage-received { border-left-color: #7686a3; }
+.ledger-row.stage-risk_checked { border-left-color: var(--amber); }
+.ledger-row.stage-settled { border-left-color: var(--green); }
+.ledger-row.stage-held { border-left-color: var(--amber); }
+.ledger-row.stage-failed { border-left-color: var(--red); }
+
+.ledger-tag {
+  font-size: 0.72rem;
+  color: #9fb0c9;
+  padding-top: 0.1rem;
+}
+
+.ledger-detail { font-size: 0.88rem; }
+.ledger-sub {
+  font-size: 0.74rem;
+  color: #7686a3;
+  margin-top: 0.25rem;
+}
+.ledger-sub a { color: var(--green); text-decoration: none; }
+.ledger-sub a:hover { text-decoration: underline; }
+
+.ledger-time {
+  font-size: 0.72rem;
+  color: #566a8c;
+  white-space: nowrap;
+}
+
+.mono { font-family: var(--mono); }
+
+.foot {
+  margin-top: 2.5rem;
+  text-align: center;
+  font-size: 0.82rem;
+  color: #566a8c;
+}
+
+@media (max-width: 760px) {
+  .grid {
+    grid-template-columns: 1fr;
+    grid-template-areas: "treasury" "agents" "ledger";
+  }
+  .ledger-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+==================================================
+FILE: frontend/src/main.tsx
+==================================================
+
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+
+==================================================
+FILE: frontend/.env.example
+==================================================
+
+VITE_TREASURY_AGENT_URL=http://localhost:4001
+
+
+==================================================
+FILE: frontend/index.html
+==================================================
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>frontend</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+
+==================================================
+FILE: frontend/tsconfig.node.json
+==================================================
+
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "module": "nodenext",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["vite.config.ts"]
+}
+
+
+==================================================
+FILE: frontend/package.json
+==================================================
+
+{
+  "name": "buildfi-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.2",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "oxlint": "^1.71.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.1.1"
+  }
+}
+
+
+==================================================
+FILE: frontend/vite.config.ts
+==================================================
+
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+})
+
+
+==================================================
+FILE: frontend/.oxlintrc.json
+==================================================
+
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "oxc"],
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/only-export-components": ["warn", { "allowConstantExport": true }]
+  }
+}
+
+
+==================================================
+FILE: .env.example
+==================================================
+
+RPC_URL=https://rpc.testnet.arc.network
+PRIVATE_KEY=0x...
+
+# Existing ConstructOS Inspector contracts (reused, already deployed)
+CONTRACT_ESCROW=0x1D4dB36a97aFf39e93071C45A1944864d6A8E70D
+CONTRACT_IDENTITY=0x3EC9Cd867B9Eaf94380bc8a20EEcC27E02AC2812
+
+# Agent addresses to register
+INSPECTOR_AGENT_ADDRESS=0x...
+TREASURY_AGENT_ADDRESS=0x...
+
+# Metadata URIs (raw GitHub links to metadata/*.json once pushed)
+INSPECTOR_METADATA_URI=https://raw.githubusercontent.com/abdulsaminu/BuildFi/main/metadata/inspector-agent.json
+TREASURY_METADATA_URI=https://raw.githubusercontent.com/abdulsaminu/BuildFi/main/metadata/treasury-agent.json
+
+# Treasury Agent's Circle Developer-Controlled Wallet (reused from ConstructOS Finance)
+CIRCLE_API_KEY=
+CIRCLE_ENTITY_SECRET=
+CIRCLE_WALLET_SET_ID=14b32ac9-4d11-5ca1-80bf-3e23f49cb8ad
+TREASURY_WALLET_ADDRESS=0xa3f963861dad702fb8bb1c533c0a5e406dfb76cb
+
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Treasury Agent process
+TREASURY_AGENT_PORT=4001
+TREASURY_WALLET_ID=
+USDC_TOKEN_ID=
+
+# CCTP cross-chain settlement (Arc -> Ethereum Sepolia)
+SEPOLIA_WALLET_ID=
+ARC_USDC_ADDRESS=0x3600000000000000000000000000000000000000
+
+
+==================================================
+FILE: package.json
+==================================================
+
+{
+  "name": "buildfi",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "register-agents": "hardhat run scripts/registerAgents.ts --network arcTestnet",
+    "treasury-agent": "tsx agent/treasuryAgent.ts"
+  },
+  "dependencies": {
+    "@circle-fin/developer-controlled-wallets": "latest",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "dotenv": "^16.4.5",
+    "hardhat": "^2.22.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}
+
+
+==================================================
+FILE: CHECKPOINT.md
+==================================================
+
+# Mid-Hackathon Checkpoint
+
+## What's working now
+- [x] Inspector Agent — confirmed live from prior project (construct-os-v2), links added
+- [x] Correction found: original deploy.ts never called registerAgent() on AgentIdentity — INSPECTOR_AGENT_ADDRESS was an address convention only, not a real registration
+- [x] scripts/registerAgents.ts written — real registerAgent() calls for both Inspector + Treasury agents against existing AgentIdentity registry (0x3EC9...C2812)
+- [x] **Treasury Agent identity (ERC-8004) registered on-chain, confirmed:**
+  - Inspector Agent (`0xa6351CD3E0917CDe5Ce054B612aB1c84A061F38F`) — tx [`0x6aa9222e...`](https://testnet.arcscan.app/tx/0x6aa9222e28e66307fb5a99154e0738587c69b2c679f0a6bfa3cc85b7257bc2c7), block 53332940, reputation initialized to 50
+  - Treasury Agent (`0xa3f963861dad702fb8bb1c533c0a5e406dfb76cb`) — tx [`0x6fd008c9...`](https://testnet.arcscan.app/tx/0x6fd008c97c2699044e10a42f8d9091ebc46a825c33cdc5fc75e252e1323e4d30), block 53332948, reputation initialized to 50
+- [ ] Agent decision loop: verified signal -> risk check -> autonomous settlement call
+- [ ] End-to-end test: one real Inspector -> Treasury -> on-chain USDC settlement, tx hash captured
+
+## Reused infrastructure (see README for full table)
+- ConstructOS Inspector Agent (oracle verification, ERC-8004, ERC-8183) — repo: construct-os-v2
+- ConstructOS Finance / CFEL (treasury engine, CircleSettlementAdapter)
+
+## New for BuildFi
+- Real on-chain agent identity registration for both agents (previous project only used address convention, never actually called registerAgent)
+- Agent decision loop (forked from circlefin/agent-stack-starter-kits, kits/claude-agent-sdk) — in progress
+- Unified dashboard — not started
+
+## Remaining before final submission
+- Agent decision loop wiring (Phase 2)
+- End-to-end demo: Inspector verification -> Treasury autonomous settlement (Phase 3)
+- Dashboard (Phase 4)
+
+## Links
+- Repo: https://github.com/abdulsaminu/BuildFi
+- Presentation: (add)
+- Demo tx / explorer link: (add once Phase 3 test passes)
+- AgentIdentity registry on explorer: https://testnet.arcscan.app/address/0x3EC9Cd867B9Eaf94380bc8a20EEcC27E02AC2812
+
+

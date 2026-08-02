@@ -1,13 +1,4 @@
 node_modules/
-.env
-.env.*
-*.Zone.Identifier
 dist/
-data/circle-wallets.json
-data/treasury-state.json
-AI_CHECKPOINT/
-ai-checkpoint.sh
-AI_CHECKPOINT/
-ai-checkpoint.sh
-cache/
-*.mp4
+*.Zone.Identifier
+.env

@@ -1,0 +1,73 @@
+=== Git Status ===
+ M .gitignore
+ M agent/treasuryAgent.ts
+ M package-lock.json
+ M package.json
+?? .env.example
+?? AI_CHECKPOINT/
+?? agent/cctp.ts
+?? ai-checkpoint.sh
+?? ai-checkpoint.sh:Zone.Identifier
+?? data/
+?? frontend/
+?? scripts/create-sepolia-wallet.ts
+?? scripts/test-cctp-burn.ts
+?? scripts/test-cctp-mint.ts
+
+=== Current Branch ===
+main
+
+=== Remote URLs ===
+origin	https://github.com/abdulsaminu/BuildFi.git (fetch)
+origin	https://github.com/abdulsaminu/BuildFi.git (push)
+
+=== Last 20 Commits ===
+77db17d Ignore video files
+96b7c44 Remove hardhat cache from tracking
+3880545 Remove AI checkpoint dump (not needed for submission)
+f73c126 Checkpoint 2: confirmed end-to-end autonomous settlement, on-chain evidence
+a7e12a9 Checkpoint 2: repo, architecture, on-chain agent registration, Treasury Agent wired
+3cbc68d Phase 2: Treasury Agent (risk check, Circle settlement, webhook listener)
+610ae53 Update checkpoint with on-chain registration evidence
+149630c Phase 1: agent registration script, metadata, hardhat/tsconfig
+e58faf9 Remove Zone.Identifier files, fix gitignore pattern
+cc6e65d Phase 0: scaffold BuildFi repo
+
+=== Changed Files (Staged + Unstaged) ===
+.gitignore
+agent/treasuryAgent.ts
+package-lock.json
+package.json
+
+=== Untracked Files ===
+.env.example
+AI_CHECKPOINT/2026-08-02_20-34-07/AI_CONTEXT.md
+AI_CHECKPOINT/2026-08-02_20-34-07/GIT_INFO.txt
+AI_CHECKPOINT/2026-08-02_20-34-07/PROJECT_DUMP.txt
+AI_CHECKPOINT/2026-08-02_20-34-07/PROJECT_STATUS.md
+AI_CHECKPOINT/2026-08-02_20-34-07/SYSTEM_INFO.txt
+agent/cctp.ts
+ai-checkpoint.sh
+ai-checkpoint.sh:Zone.Identifier
+data/treasury-state.json
+frontend/.env.example
+frontend/.oxlintrc.json
+frontend/README.md
+frontend/index.html
+frontend/package-lock.json
+frontend/package.json
+frontend/public/favicon.svg
+frontend/public/icons.svg
+frontend/src/App.css
+frontend/src/App.tsx
+frontend/src/index.css
+frontend/src/main.tsx
+frontend/tsconfig.app.json
+frontend/tsconfig.json
+frontend/tsconfig.node.json
+frontend/vite.config.ts
+scripts/create-sepolia-wallet.ts
+scripts/test-cctp-burn.ts
+scripts/test-cctp-mint.ts
+
+=== Stash List ===
