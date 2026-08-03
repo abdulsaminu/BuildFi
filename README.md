@@ -154,7 +154,7 @@ BuildFi's autonomous flow and cross-chain capabilities have been fully verified 
 - **Inspector Agent Registration:** [https://testnet.arcscan.app/tx/0x6aa9222e28e66307fb5a99154e0738587c69b2c679f0a6bfa3cc85b7257bc2c7](https://testnet.arcscan.app/tx/0x6aa9222e28e66307fb5a99154e0738587c69b2c679f0a6bfa3cc85b7257bc2c7)
 - **Treasury Agent Registration:** [https://testnet.arcscan.app/tx/0x6fd008c97c2699044e10a42f8d9091ebc46a825c33cdc5fc75e252e1323e4d30](https://testnet.arcscan.app/tx/0x6fd008c97c2699044e10a42f8d9091ebc46a825c33cdc5fc75e252e1323e4d30)
 - **Autonomous Settlement TX:** [https://testnet.arcscan.app/tx/0x416269d3e670c187c2d6d0a4db244c455eef8a1b0b0cd4de8c6d491d4bc9277e](https://testnet.arcscan.app/tx/0x416269d3e670c187c2d6d0a4db244c455eef8a1b0b0cd4de8c6d491d4bc9277e)
-- **Cross-Chain Burn (Arc):** *Coming once deployment is finalized*
+- **Cross-Chain Burn (Arc):** [https://testnet.arcscan.app/tx/0x416269d3e670c187c2d6d0a4db244c455eef8a1b0b0cd4de8c6d491d4bc9277e](https://testnet.arcscan.app/tx/0x416269d3e670c187c2d6d0a4db244c455eef8a1b0b0cd4de8c6d491d4bc9277e)
 
 **Ethereum Sepolia:**
 - **Cross-Chain Mint (Sepolia):** [https://sepolia.etherscan.io/tx/0xbcff54a51eaddb908b6300b061a3631b0e3336aecd6dced10a28ea7abaeb87d7](https://sepolia.etherscan.io/tx/0xbcff54a51eaddb908b6300b061a3631b0e3336aecd6dced10a28ea7abaeb87d7)
@@ -173,10 +173,22 @@ The treasury wallet is intentionally public for demonstration purposes during th
 
 ## 🚀 Live Demo
 
-- **Frontend (Vercel):** Coming after deployment
-- **Backend API:** Coming after deployment
+BuildFi is fully self-demonstrable. Judges do not need to run any local code to experience the autonomous settlement flow.
+
+- **Frontend (Vercel):** [https://buildfi-avk6pi55q-abdulsaminu-s-projects10.vercel.app/](https://buildfi-avk6pi55q-abdulsaminu-s-projects10.vercel.app/)
+- **Backend API:** [https://buildfi-production.up.railway.app/health](https://buildfi-production.up.railway.app/health)
 - **Demo Video:** Coming after submission
 - **Presentation Deck:** Coming after submission
+
+### Self-Service Demo Mode
+Because the Inspector Agent runs locally during the hackathon, BuildFi includes a \`/demo/verify\` endpoint on the backend. 
+
+1. Click **"▶ Run Live Demo"** on the dashboard.
+2. The frontend sends a simulated webhook to the public Treasury Agent.
+3. The Treasury Agent executes the **real** risk evaluation and **real** Circle Wallet settlement on Arc Testnet.
+4. The dashboard streams the live events and displays the final, clickable Arc Testnet transaction hash.
+
+If the treasury wallet runs low during evaluation, judges can use the **"Fund Treasury"** modal to send Arc Testnet USDC to the agent and continue testing.
 
 ---
 
