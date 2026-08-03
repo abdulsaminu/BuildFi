@@ -11,7 +11,6 @@
 BuildFi combines AI agents, Circle Developer-Controlled Wallets, ERC-8004 agent identities, and CCTP V2 to automate milestone verification, treasury risk evaluation, and USDC settlement without manual intervention.
 
 ![BuildFi Dashboard](https://raw.githubusercontent.com/abdulsaminu/BuildFi/main/docs/dashboard.png)
-*(Note: Replace this URL with your actual hosted Vercel screenshot URL once deployed)*
 
 ---
 
