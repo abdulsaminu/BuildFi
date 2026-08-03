@@ -154,7 +154,7 @@ BuildFi's autonomous flow and cross-chain capabilities have been fully verified 
 - **Inspector Agent Registration:** [https://testnet.arcscan.app/tx/0x6aa9222e28e66307fb5a99154e0738587c69b2c679f0a6bfa3cc85b7257bc2c7](https://testnet.arcscan.app/tx/0x6aa9222e28e66307fb5a99154e0738587c69b2c679f0a6bfa3cc85b7257bc2c7)
 - **Treasury Agent Registration:** [https://testnet.arcscan.app/tx/0x6fd008c97c2699044e10a42f8d9091ebc46a825c33cdc5fc75e252e1323e4d30](https://testnet.arcscan.app/tx/0x6fd008c97c2699044e10a42f8d9091ebc46a825c33cdc5fc75e252e1323e4d30)
 - **Autonomous Settlement TX:** [https://testnet.arcscan.app/tx/0x416269d3e670c187c2d6d0a4db244c455eef8a1b0b0cd4de8c6d491d4bc9277e](https://testnet.arcscan.app/tx/0x416269d3e670c187c2d6d0a4db244c455eef8a1b0b0cd4de8c6d491d4bc9277e)
-- **Cross-Chain Burn (Arc):** [https://testnet.arcscan.app/tx/0x416269d3e670c187c2d6d0a4db244c455eef8a1b0b0cd4de8c6d491d4bc9277e](https://testnet.arcscan.app/tx/0x416269d3e670c187c2d6d0a4db244c455eef8a1b0b0cd4de8c6d491d4bc9277e)
+- **Cross-Chain Burn (Arc):** [https://testnet.arcscan.app/tx/0x7af5a3d851b866e55c5f60425bdc5c976a69c96edef55d2fe272218bdec80a05](https://testnet.arcscan.app/tx/0x7af5a3d851b866e55c5f60425bdc5c976a69c96edef55d2fe272218bdec80a05)
 
 **Ethereum Sepolia:**
 - **Cross-Chain Mint (Sepolia):** [https://sepolia.etherscan.io/tx/0xbcff54a51eaddb908b6300b061a3631b0e3336aecd6dced10a28ea7abaeb87d7](https://sepolia.etherscan.io/tx/0xbcff54a51eaddb908b6300b061a3631b0e3336aecd6dced10a28ea7abaeb87d7)
