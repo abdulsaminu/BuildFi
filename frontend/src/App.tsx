@@ -189,6 +189,7 @@ function App() {
   const [events, setEvents] = useState<FlowEvent[]>([]);
   const [connected, setConnected] = useState(false);
   const [isFundModalOpen, setIsFundModalOpen] = useState(false);
+  const [isDemoLoading, setIsDemoLoading] = useState(false);
 
   const poll = useCallback(async () => {
     try {
@@ -223,6 +224,19 @@ function App() {
 
   const handleCopyWallet = () => {
     navigator.clipboard.writeText(TREASURY_WALLET_ADDRESS);
+  };
+
+  const handleRunDemo = async () => {
+    setIsDemoLoading(true);
+    try {
+      await fetch(`${API_BASE}/demo/verify`, { method: "POST" });
+      // The 3-second polling will automatically pick up the new events.
+    } catch (err) {
+      console.error("Demo failed:", err);
+    } finally {
+      // Keep button disabled for ~5 seconds so the user can watch the timeline flow.
+      setTimeout(() => setIsDemoLoading(false), 5000);
+    }
   };
 
   return (
@@ -296,7 +310,17 @@ function App() {
             <DashboardCard title="Live Activity Timeline">
               <div className="timeline-header">
                 <span>Real-time autonomous settlement flow</span>
-                <span className="settlement-count">{totalSettlements} Total Settlements</span>
+                <div style={{ display: "flex", gap: "1rem", alignItems: "center" }}>
+                  <span className="settlement-count">{totalSettlements} Total Settlements</span>
+                  <button 
+                    className="btn-action btn-primary" 
+                    onClick={handleRunDemo} 
+                    disabled={isDemoLoading || !connected}
+                    style={{ padding: "0.5rem 1rem", fontSize: "0.8rem" }}
+                  >
+                    {isDemoLoading ? "Processing Demo..." : "▶ Run Live Demo"}
+                  </button>
+                </div>
               </div>
               <div className="timeline-container">
                 {events.length === 0 ? <ProofTimeline /> : events.map((e) => <TimelineEvent key={e.id} event={e} />)}

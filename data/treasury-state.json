@@ -1,6 +1,6 @@
 {
   "projectBudgetTotal": 90000,
-  "projectBudgetRemaining": 89996,
+  "projectBudgetRemaining": 89995,
   "settlements": [
     {
       "milestoneId": "0a3917bebbc2fa714c2be8fe4d21f2267e96e7d4698b38db914fbf4010c680cc",
@@ -15,6 +15,13 @@
       "amount": 2,
       "txHash": "0x6093f3a79c9e75e149722b8b637db26034be899ec94535af0880dbabf74caefc",
       "settledAt": "2026-08-02T22:00:48.266Z"
+    },
+    {
+      "milestoneId": "0xd76f4183e3235000000000000000000000000000000000000000000000000000",
+      "contractorAddress": "0xFFD3347ca0C3Ba5a104Ed9113C1d7F65d0C85a8A",
+      "amount": 1,
+      "txHash": "0x3b290f873b197180388e969f3fbaebb283f40c45ccb6b47defe862e9eddc9e02",
+      "settledAt": "2026-08-02T23:40:52.047Z"
     }
   ]
 }

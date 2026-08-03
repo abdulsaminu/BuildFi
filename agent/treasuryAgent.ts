@@ -124,6 +124,68 @@ app.post("/verified-milestone", async (req, res) => {
   return res.status(200).json({ decision: "SETTLE", risk, receipt });
 });
 
+// --- DEMO ENDPOINT FOR HACKATHON JUDGES ---
+// Simulates the Inspector Agent verifying a milestone and sending the webhook.
+// Allows judges to test the full autonomous settlement flow directly from the UI.
+app.post("/demo/verify", async (_req, res) => {
+  try {
+    const milestoneId = "0x" + Math.random().toString(16).slice(2, 66).padEnd(64, "0");
+    const contractorAddress = "0xFFD3347ca0C3Ba5a104Ed9113C1d7F65d0C85a8A"; // Test contractor
+    const amount = 1.00; // Keep it small so the treasury lasts a long time
+
+    console.log(`[treasury-agent] DEMO MODE: Received simulated milestone ${milestoneId} for ${contractorAddress}, amount ${amount}`);
+    logEvent({ milestoneId, contractorAddress, amount, stage: "received", detail: "Inspector Agent verified milestone (Demo)" });
+
+    // 1. Fetch live balance
+    let treasuryBalance: number;
+    try {
+      treasuryBalance = await getWalletBalance();
+    } catch (err) {
+      console.error(`[treasury-agent] Failed to fetch live balance:`, err instanceof Error ? err.message : err);
+      logEvent({ milestoneId, contractorAddress, amount, stage: "failed", detail: "Could not verify live treasury balance" });
+      return res.status(200).json({ decision: "HOLD", reason: "Could not verify live treasury balance" });
+    }
+
+    // 2. Run risk check
+    const projectState = loadTreasuryState();
+    const recentBurnRate = computeRecentBurnRate();
+    const risk = runRiskCheck({
+      amount,
+      treasuryBalance,
+      projectBudgetRemaining: projectState.projectBudgetRemaining,
+      recentBurnRate,
+    });
+
+    console.log(
+      `[treasury-agent] DEMO Risk check: ${risk.decision} (${risk.riskLevel}) — ${risk.reason} ` +
+      `[balance: ${treasuryBalance.toFixed(2)}, budget remaining: ${projectState.projectBudgetRemaining.toFixed(2)}]`
+    );
+    logEvent({ milestoneId, contractorAddress, amount, stage: "risk_checked", detail: `${risk.decision}: ${risk.reason}` });
+
+    if (risk.decision === "HOLD") {
+      logEvent({ milestoneId, contractorAddress, amount, stage: "held", detail: risk.reason });
+      return res.status(200).json({ decision: "HOLD", risk });
+    }
+
+    // 3. Execute settlement via Circle
+    const receipt = await settleViaCircle(contractorAddress, amount.toFixed(2));
+    console.log(`[treasury-agent] DEMO Settlement: ${receipt.status}`, receipt.txHash ?? receipt.reason ?? "");
+
+    if (receipt.status === "confirmed" && receipt.txHash) {
+      recordSettlement(milestoneId, contractorAddress, amount, receipt.txHash);
+      logEvent({ milestoneId, contractorAddress, amount, stage: "settled", detail: receipt.txHash });
+    } else {
+      logEvent({ milestoneId, contractorAddress, amount, stage: "failed", detail: receipt.reason || "Settlement failed" });
+    }
+
+    return res.status(200).json({ decision: "SETTLE", risk, receipt });
+  } catch (err) {
+    console.error("[treasury-agent] Demo endpoint error:", err);
+    return res.status(500).json({ error: "Demo failed" });
+  }
+});
+// --- END DEMO ENDPOINT ---
+
 app.get("/activity", (_req, res) => {
   res.json({ events: recentEvents });
 });
