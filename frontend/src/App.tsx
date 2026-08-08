@@ -1,11 +1,8 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import "./App.css";
 
 const API_BASE = import.meta.env.VITE_TREASURY_AGENT_URL || "http://localhost:4001";
 const EXPLORER_TX = "https://testnet.arcscan.app/tx/";
-const EXPLORER_ADDR = "https://testnet.arcscan.app/address/";
-const TREASURY_WALLET_ADDRESS = "0xa3f963861dad702fb8bb1c533c0a5e406dfb76cb";
-const MIN_TREASURY_BALANCE = 10; // Threshold for "low balance" warning
 
 const PROOF_SETTLEMENT_TX = "0x416269d3e670c187c2d6d0a4db244c455eef8a1b0b0cd4de8c6d491d4bc9277e";
 const PROOF_STEPS = [
@@ -15,6 +12,8 @@ const PROOF_STEPS = [
   "Circle Wallet executed settlement",
   "Settlement confirmed on Arc Testnet",
 ];
+
+const MAX_CONSECUTIVE_FAILURES_FOR_ERROR = 3;
 
 // --- Icons ---
 const Icon = ({ path, className = "icon" }: { path: string; className?: string }) => (
@@ -33,9 +32,8 @@ const Icons = {
   User: "M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z",
   Wallet: "M21 12V7H5a2 2 0 0 1 0-4h14v4M3 5v14a2 2 0 0 0 2 2h16v-5M18 12a2 2 0 0 0 0 4h4v-4Z",
   Bridge: "M3 12h18M3 12a4 4 0 0 1 4-4M21 12a4 4 0 0 1-4 4M7 8v8M17 8v8",
-  Copy: "M8 10H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2M8 10v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-8M8 10h8M16 8V6a2 2 0 0 0-2-2h-2",
-  ExternalLink: "M15 3h6v6M10 14L21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6",
-  X: "M18 6L6 18M6 6l12 12",
+  Alert: "M12 9v4M12 17h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z",
+  X: "M18 6 6 18M6 6l12 12",
 };
 
 // --- Types ---
@@ -63,6 +61,12 @@ interface TreasuryHealth {
     projectBudgetRemaining: number;
     settlements: Array<{ milestoneId: string; amount: number; txHash: string; settledAt: string }>;
   };
+}
+
+interface Toast {
+  id: string;
+  message: string;
+  kind: "success" | "error" | "info";
 }
 
 const STAGE_LABEL: Record<FlowEvent["stage"], string> = {
@@ -94,8 +98,8 @@ const DashboardCard = ({ title, children, className = "" }: { title?: string; ch
   </div>
 );
 
-const TimelineEvent = ({ event }: { event: FlowEvent }) => (
-  <div className={`timeline-event ${event.stage}`}>
+const TimelineEvent = ({ event, isNew }: { event: FlowEvent; isNew?: boolean }) => (
+  <div className={`timeline-event ${event.stage} ${isNew ? "fade-in" : ""}`}>
     <div className="timeline-marker">
       <Icon path={event.stage === "settled" ? Icons.CheckCircle : event.stage === "failed" ? Icons.Shield : Icons.Activity} />
     </div>
@@ -138,49 +142,51 @@ const ProofTimeline = () => (
         View Explorer ↗
       </a>
     </div>
+    <p className="proof-caption">No new milestones yet — here's the most recent confirmed settlement while you wait.</p>
   </div>
 );
 
-// --- Fund Treasury Modal ---
-const FundTreasuryModal = ({ onClose }: { onClose: () => void }) => {
-  const [copied, setCopied] = useState(false);
+// --- Skeletons ---
+const SkeletonLine = ({ w = "100%" }: { w?: string }) => <div className="skeleton-line" style={{ width: w }} />;
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(TREASURY_WALLET_ADDRESS);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-header">Fund BuildFi Treasury</div>
-        <div className="modal-body">
-          BuildFi uses a public Circle Developer-Controlled Wallet for live demonstrations on Arc Testnet.
-          <br /><br />
-          If the treasury balance becomes low, anyone with Arc Testnet USDC may replenish the treasury by sending funds to the address below.
-        </div>
-        
-        <div className="modal-wallet-box">
-          <div className="wallet-label">Treasury Wallet Address</div>
-          <div className="wallet-address">{TREASURY_WALLET_ADDRESS}</div>
-        </div>
-
-        <div className="modal-actions">
-          <button className="btn-action" onClick={handleCopy}>
-            <Icon path={Icons.Copy} className="icon" />
-            {copied ? "Copied!" : "Copy Address"}
-          </button>
-          <a href={`${EXPLORER_ADDR}${TREASURY_WALLET_ADDRESS}`} target="_blank" rel="noreferrer" className="btn-action">
-            <Icon path={Icons.ExternalLink} className="icon" />
-            View on Arc Explorer
-          </a>
-          <button className="btn-action btn-primary" onClick={onClose}>Close</button>
+const TimelineSkeleton = () => (
+  <div className="timeline-container">
+    {[0, 1, 2].map((i) => (
+      <div className="timeline-event skeleton-row" key={i}>
+        <div className="skeleton-circle" />
+        <div className="timeline-content">
+          <SkeletonLine w="30%" />
+          <SkeletonLine w="70%" />
+          <SkeletonLine w="50%" />
         </div>
       </div>
-    </div>
-  );
-};
+    ))}
+  </div>
+);
+
+const TreasurySkeleton = () => (
+  <>
+    <div className="balance-label">Treasury Balance</div>
+    <SkeletonLine w="50%" />
+    <div className="skeleton-spacer" />
+    <SkeletonLine w="100%" />
+  </>
+);
+
+// --- Toasts ---
+const ToastStack = ({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: string) => void }) => (
+  <div className="toast-stack">
+    {toasts.map((t) => (
+      <div key={t.id} className={`toast toast-${t.kind} fade-in`}>
+        <Icon path={t.kind === "success" ? Icons.CheckCircle : t.kind === "error" ? Icons.Alert : Icons.Activity} className="toast-icon" />
+        <span>{t.message}</span>
+        <button className="toast-close" onClick={() => onDismiss(t.id)} aria-label="Dismiss">
+          <Icon path={Icons.X} className="toast-close-icon" />
+        </button>
+      </div>
+    ))}
+  </div>
+);
 
 // --- Main App ---
 function App() {
@@ -188,8 +194,25 @@ function App() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [events, setEvents] = useState<FlowEvent[]>([]);
   const [connected, setConnected] = useState(false);
-  const [isFundModalOpen, setIsFundModalOpen] = useState(false);
-  const [isDemoLoading, setIsDemoLoading] = useState(false);
+  const [loadingInitial, setLoadingInitial] = useState(true);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const [newestEventId, setNewestEventId] = useState<string | null>(null);
+
+  const knownEventIds = useRef<Set<string>>(new Set());
+  const hasLoadedOnce = useRef(false);
+
+  const pushToast = useCallback((message: string, kind: Toast["kind"] = "info") => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    setToasts((prev) => [...prev, { id, message, kind }]);
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 5000);
+  }, []);
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
 
   const poll = useCallback(async () => {
     try {
@@ -198,15 +221,32 @@ function App() {
         fetch(`${API_BASE}/agents`).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`/agents ${r.status}`)))),
         fetch(`${API_BASE}/activity`).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`/activity ${r.status}`)))),
       ]);
+
+      const newEvents: FlowEvent[] = ev.events || [];
+      if (hasLoadedOnce.current) {
+        const freshlySettled = newEvents.find((e) => e.stage === "settled" && !knownEventIds.current.has(e.id));
+        if (freshlySettled) {
+          pushToast(`Settlement confirmed — ${freshlySettled.amount} USDC`, "success");
+          setNewestEventId(freshlySettled.id);
+          setTimeout(() => setNewestEventId(null), 1200);
+        }
+      }
+      knownEventIds.current = new Set(newEvents.map((e) => e.id));
+      hasLoadedOnce.current = true;
+
       setHealth(h);
       setAgents(a.agents);
-      setEvents(ev.events);
+      setEvents(newEvents);
       setConnected(true);
+      setConsecutiveFailures(0);
+      setLoadingInitial(false);
     } catch (err) {
       console.warn("[buildfi] poll failed:", err);
       setConnected(false);
+      setLoadingInitial(false);
+      setConsecutiveFailures((n) => n + 1);
     }
-  }, []);
+  }, [pushToast]);
 
   useEffect(() => {
     poll();
@@ -220,29 +260,12 @@ function App() {
 
   const totalSettlements = health?.projectState.settlements.length || 0;
   const treasuryStatus = budgetPct > 20 ? "Healthy" : "Warning";
-  const isLowBalance = health ? health.treasuryBalance < MIN_TREASURY_BALANCE : false;
-
-  const handleCopyWallet = () => {
-    navigator.clipboard.writeText(TREASURY_WALLET_ADDRESS);
-  };
-
-  const handleRunDemo = async () => {
-    setIsDemoLoading(true);
-    try {
-      await fetch(`${API_BASE}/demo/verify`, { method: "POST" });
-      // The 3-second polling will automatically pick up the new events.
-    } catch (err) {
-      console.error("Demo failed:", err);
-    } finally {
-      // Keep button disabled for ~5 seconds so the user can watch the timeline flow.
-      setTimeout(() => setIsDemoLoading(false), 5000);
-    }
-  };
+  const showHardError = consecutiveFailures >= MAX_CONSECUTIVE_FAILURES_FOR_ERROR;
 
   return (
     <div className="app-layout">
-      {isFundModalOpen && <FundTreasuryModal onClose={() => setIsFundModalOpen(false)} />}
-      
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
+
       <aside className="sidebar">
         <div className="sidebar-brand">
           <img src="/logo.png" alt="BuildFi Logo" className="sidebar-logo" />
@@ -268,11 +291,24 @@ function App() {
             <p className="tagline">Programmable Finance Infrastructure for Construction</p>
             <p className="subhead">Autonomous agent-to-agent USDC settlement on Arc</p>
           </div>
-          <div className={`status-pill ${connected ? "live" : "offline"}`}>
+          <div className={`status-pill ${connected ? "live" : showHardError ? "error" : "offline"}`}>
             <span className="dot" />
-            {connected ? "Treasury Agent Live" : "Connecting…"}
+            {connected ? "Treasury Agent Live" : showHardError ? "Connection Error" : "Connecting…"}
           </div>
         </header>
+
+        {showHardError && (
+          <div className="error-banner fade-in">
+            <Icon path={Icons.Alert} className="error-banner-icon" />
+            <div>
+              <div className="error-banner-title">Can't reach the Treasury Agent</div>
+              <div className="error-banner-sub">
+                We've retried {consecutiveFailures} times. The backend may be waking up (Railway free tier) — this page will
+                reconnect automatically once it's back.
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="badge-row">
           <span className="proof-badge">Arc Testnet</span>
@@ -310,79 +346,53 @@ function App() {
             <DashboardCard title="Live Activity Timeline">
               <div className="timeline-header">
                 <span>Real-time autonomous settlement flow</span>
-                <div style={{ display: "flex", gap: "1rem", alignItems: "center" }}>
-                  <span className="settlement-count">{totalSettlements} Total Settlements</span>
-                  <button 
-                    className="btn-action btn-primary" 
-                    onClick={handleRunDemo} 
-                    disabled={isDemoLoading || !connected}
-                    style={{ padding: "0.5rem 1rem", fontSize: "0.8rem" }}
-                  >
-                    {isDemoLoading ? "Processing Demo..." : "▶ Run Live Demo"}
-                  </button>
+                <span className="settlement-count">{totalSettlements} Total Settlements</span>
+              </div>
+              {loadingInitial ? (
+                <TimelineSkeleton />
+              ) : events.length === 0 ? (
+                <ProofTimeline />
+              ) : (
+                <div className="timeline-container">
+                  {events.map((e) => (
+                    <TimelineEvent key={e.id} event={e} isNew={e.id === newestEventId} />
+                  ))}
                 </div>
-              </div>
-              <div className="timeline-container">
-                {events.length === 0 ? <ProofTimeline /> : events.map((e) => <TimelineEvent key={e.id} event={e} />)}
-              </div>
+              )}
             </DashboardCard>
           </div>
 
           <div className="right-col">
             <DashboardCard title="Treasury Overview">
-              <div className="treasury-balance">
-                <div className="balance-label">Treasury Balance</div>
-                <div className="balance-row">
-                  <span className="big-number">
-                    {health ? health.treasuryBalance.toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"}
-                  </span>
-                  <span className="unit">USDC</span>
-                </div>
-              </div>
-              
-              <div className="budget-row">
-                <span>Budget Remaining</span>
-                <span>{health ? health.projectState.projectBudgetRemaining.toLocaleString() : "—"} USDC</span>
-              </div>
-              <div className="meter">
-                <div className="meter-fill" style={{ width: `${budgetPct}%` }} />
-              </div>
-              <div className="budget-caption">
-                <span>Budget Utilization</span>
-                <span>{100 - budgetPct}%</span>
-              </div>
-              <div className="health-badge-wrapper">
-                <span className={`status-badge ${treasuryStatus.toLowerCase()}`}>{treasuryStatus}</span>
-              </div>
-
-              {/* --- New Treasury Funding Section --- */}
-              <div className="treasury-funding-section">
-                <div className="wallet-label">Treasury Wallet</div>
-                <div className="wallet-row">
-                  <span className="wallet-address">{shortAddr(TREASURY_WALLET_ADDRESS)}</span>
-                </div>
-                <div className="wallet-actions">
-                  <button className="btn-action" onClick={handleCopyWallet}>
-                    <Icon path={Icons.Copy} className="icon" /> Copy Address
-                  </button>
-                  <a href={`${EXPLORER_ADDR}${TREASURY_WALLET_ADDRESS}`} target="_blank" rel="noreferrer" className="btn-action">
-                    <Icon path={Icons.ExternalLink} className="icon" /> View on Explorer
-                  </a>
-                  <button className="btn-action btn-primary" onClick={() => setIsFundModalOpen(true)}>
-                    Fund Treasury
-                  </button>
-                </div>
-
-                {health && (
-                  <div className={`treasury-status ${isLowBalance ? "warning" : ""}`}>
-                    <span className="dot" />
-                    {isLowBalance 
-                      ? "Treasury balance is running low. Help keep BuildFi publicly testable by replenishing the treasury with Arc Testnet USDC."
-                      : "Ready for Live Demonstrations"
-                    }
+              {loadingInitial ? (
+                <TreasurySkeleton />
+              ) : (
+                <>
+                  <div className="treasury-balance">
+                    <div className="balance-label">Treasury Balance</div>
+                    <div className="balance-row">
+                      <span className="big-number">
+                        {health ? health.treasuryBalance.toLocaleString(undefined, { maximumFractionDigits: 2 }) : "—"}
+                      </span>
+                      <span className="unit">USDC</span>
+                    </div>
                   </div>
-                )}
-              </div>
+                  <div className="budget-row">
+                    <span>Budget Remaining</span>
+                    <span>{health ? health.projectState.projectBudgetRemaining.toLocaleString() : "—"} USDC</span>
+                  </div>
+                  <div className="meter">
+                    <div className="meter-fill" style={{ width: `${budgetPct}%` }} />
+                  </div>
+                  <div className="budget-caption">
+                    <span>Budget Utilization</span>
+                    <span>{100 - budgetPct}%</span>
+                  </div>
+                  <div className="health-badge-wrapper">
+                    <span className={`status-badge ${treasuryStatus.toLowerCase()}`}>{treasuryStatus}</span>
+                  </div>
+                </>
+              )}
             </DashboardCard>
 
             <DashboardCard title="AI Treasury Agent">
@@ -417,8 +427,16 @@ function App() {
 
             <DashboardCard title="Registered Agents">
               <div className="agents-list">
-                {agents.length === 0 ? (
-                  <div className="empty-hint">Waiting for agents…</div>
+                {agents.length === 0 && !loadingInitial ? (
+                  <div className="empty-hint">
+                    No agents responded yet. They register automatically once the Treasury Agent connects — check back in a
+                    moment.
+                  </div>
+                ) : agents.length === 0 ? (
+                  <div className="agents-skeleton">
+                    <SkeletonLine w="90%" />
+                    <SkeletonLine w="90%" />
+                  </div>
                 ) : (
                   agents.map((a) => (
                     <div key={a.role} className="agent-card-mini">

@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.Zone.Identifier
 .env
+*.mp4
+*.tsbuildinfo
